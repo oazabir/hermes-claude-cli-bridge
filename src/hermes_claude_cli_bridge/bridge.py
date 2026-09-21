@@ -14,6 +14,10 @@ Fixed flags on every call: -p, --output-format stream-json,
 --autocompact, --effort, --model, cwd. The appended system prompt can come from a
 flag/env string and/or a file (re-read on every request, so edits apply live; an
 unreadable file is an error, never silently dropped).
+
+The prompt is written to claude's stdin, not passed as an argument: Linux caps a
+single argv string at 128 KB whatever ARG_MAX says, and a mid-thread transcript
+or one pasted log goes past that.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -31,35 +37,112 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 NAMESPACE = uuid.UUID("6f1d3a52-8c1e-4c5e-9a53-4d1f6f0c7b11")
 MODELS = ["sonnet", "opus", "haiku"]
 
-CFG: argparse.Namespace  # set in main()
-_state_lock = threading.Lock()
+CFG = argparse.Namespace()  # replaced by main(); getattr(..., default) until then
+_state_lock = threading.RLock()
 _session_locks: dict[str, threading.Lock] = {}
+_slots = threading.BoundedSemaphore(8)  # resized by main(): concurrent claude processes
+
+
+class Busy(RuntimeError):
+    """Too many turns in flight, or this thread is already running one -> HTTP 429."""
 
 
 # --------------------------------------------------------------------------- state
 
+_state_cache: dict = {}
+_state_stamp: object = None  # (mtime_ns, size) of the file the cache was read from
+
 
 def _load_state() -> dict:
-    try:
-        return json.loads(Path(CFG.state_file).read_text())
-    except (OSError, ValueError):
-        return {}
+    """The state file, cached. Re-read only when it changed on disk, so /health and every turn
+    cost one stat instead of parsing the whole file (it holds one entry per Hermes thread)."""
+    global _state_cache, _state_stamp
+    with _state_lock:
+        try:
+            st = Path(CFG.state_file).stat()
+            stamp: object = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        if stamp != _state_stamp:
+            try:
+                _state_cache = json.loads(Path(CFG.state_file).read_text())
+            except (OSError, ValueError):
+                _state_cache = {}
+            _state_stamp = stamp
+        return _state_cache
 
 
 def _save_state(state: dict) -> None:
-    p = Path(CFG.state_file)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(p)
+    global _state_cache, _state_stamp
+    with _state_lock:
+        p = Path(CFG.state_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(p)
+        _state_cache = state
+        try:
+            st = p.stat()
+            _state_stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            _state_stamp = None
 
 
 def _session_lock(sid: str) -> threading.Lock:
     with _state_lock:
         return _session_locks.setdefault(sid, threading.Lock())
+
+
+# ---------------------------------------------------------------------- housekeeping
+
+
+def _forget_claude_session(sid: str) -> int:
+    """Delete Claude Code's own transcript for a session. Claude never expires these itself, so a
+    long-lived bridge otherwise keeps every thread it ever ran on disk forever."""
+    n = 0
+    for pat in (f"projects/*/{sid}.jsonl", f"projects/*/{sid}", f"todos/{sid}*"):
+        for f in CLAUDE_HOME.glob(pat):
+            try:
+                shutil.rmtree(f) if f.is_dir() else f.unlink()
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def prune_sessions() -> list[str]:
+    """Forget threads idle for longer than --session-ttl-days, here and in Claude Code."""
+    days = getattr(CFG, "session_ttl_days", 0)
+    if not days or days <= 0:
+        return []
+    cutoff = time.time() - days * 86400
+    with _state_lock:
+        state = _load_state()
+        dead = [sid for sid, e in state.items()
+                if isinstance(e, dict) and (e.get("updated") or e.get("created") or 0) < cutoff]
+        if not dead:
+            return []
+        for sid in dead:
+            state.pop(sid, None)
+            _session_locks.pop(sid, None)
+            _forget_claude_session(sid)
+        _save_state(state)
+    return dead
+
+
+def _housekeeping_loop(every: float = 6 * 3600) -> None:
+    while True:
+        try:
+            dead = prune_sessions()
+            if dead:
+                print(f"[bridge] pruned {len(dead)} session(s) idle > {CFG.session_ttl_days}d", file=sys.stderr)
+        except Exception as e:  # never let housekeeping kill the server
+            print(f"[bridge] prune failed: {e}", file=sys.stderr)
+        time.sleep(every)
 
 
 def session_uuid(hermes_session_id: str) -> str:
@@ -79,7 +162,7 @@ _MEMORY_CTX = re.compile(r"\s*<memory-context>.*?</memory-context>\s*", re.DOTAL
 def strip_memory_context(text: str) -> str:
     """Drop the <memory-context> recall block Hermes appends to user messages. Claude Code usually has its own
     memory (plugins/hooks), and Hermes' copy is a truncated head/tail digest, so it mostly duplicates and adds noise."""
-    if "<memory-context>" not in text or getattr(globals().get("CFG"), "keep_memory_context", False):
+    if "<memory-context>" not in text or getattr(CFG, "keep_memory_context", False):
         return text
     return _MEMORY_CTX.sub("\n\n", text).strip()
 
@@ -106,14 +189,23 @@ def latest_turn(messages: list[dict]) -> str:
 
 
 def transcript(messages: list[dict]) -> str:
-    """Flatten history for a brand-new Claude session that joins a thread mid-way."""
+    """Flatten history for a brand-new Claude session that joins a thread mid-way.
+    Only the newest --max-transcript-chars of history are kept: a Hermes thread can hold thousands
+    of messages, and replaying all of them into a fresh session is slow and pointless."""
     convo = [m for m in messages if m.get("role") in ("user", "assistant")]
     if len(convo) <= 1:
         return latest_turn(messages)
-    lines = ["Earlier conversation (for context):"]
-    for m in convo[:-1]:
-        lines.append(f"[{m['role']}] {_text(m.get('content'))}")
-    lines += ["", "Current message:", latest_turn(messages) or _text(convo[-1].get("content"))]
+    budget = getattr(CFG, "max_transcript_chars", 0) or 10**9
+    earlier: list[str] = []
+    for m in reversed(convo[:-1]):
+        line = f"[{m['role']}] {_text(m.get('content'))}"
+        budget -= len(line) + 1
+        if budget < 0:
+            earlier.append("[...older messages omitted...]")
+            break
+        earlier.append(line)
+    lines = ["Earlier conversation (for context):", *reversed(earlier), "",
+             "Current message:", latest_turn(messages) or _text(convo[-1].get("content"))]
     return "\n".join(lines)
 
 
@@ -200,15 +292,52 @@ def tool_headline(name: str, inp: dict) -> str:
     return f"{shown}: {detail}" if detail else shown
 
 
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill claude AND everything it spawned. claude runs bash/subagents in its own process group;
+    they inherit its stdout, so killing only the parent can leave our read loop blocked forever."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:  # pragma: no cover - non-POSIX
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None):
-    """Run one claude turn. Returns (result_event, stderr_text). Streams via on_text; on_tool(headline, is_subagent)."""
+    """Run one claude turn. Returns (result_event, stderr_text). Streams via on_text; on_tool(headline, is_subagent).
+    Waits for a concurrency slot first, so a burst of Hermes threads cannot fork unbounded claude processes."""
+    if not _slots.acquire(timeout=getattr(CFG, "queue_timeout", 120)):
+        raise Busy(f"bridge is at capacity ({CFG.max_concurrency} concurrent turns); try again shortly")
+    try:
+        return _run_claude(cmd, prompt, cwd, on_text, on_reasoning, on_tool)
+    finally:
+        _slots.release()
+
+
+def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None):
     proc = subprocess.Popen(
-        cmd + [prompt], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, bufsize=1,
+        cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
     )
+    # the prompt goes on stdin (no 128 KB argv limit); feed it from a thread so a child that
+    # does not drain stdin cannot deadlock us on a full pipe buffer
+    def _feed():
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    feeder = threading.Thread(target=_feed, daemon=True)
+    feeder.start()
     stderr_buf: list[str] = []
-    threading.Thread(target=lambda: stderr_buf.append(proc.stderr.read()), daemon=True).start()
-    timer = threading.Timer(CFG.timeout, proc.kill)
+    reader = threading.Thread(target=lambda: stderr_buf.append(proc.stderr.read() or ""), daemon=True)
+    reader.start()
+    timer = threading.Timer(CFG.timeout, _kill_tree, args=(proc,))
     timer.start()
     result = None
     seen_tools: set[str] = set()
@@ -233,20 +362,35 @@ def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None
                 result = ev
         proc.wait()
     except BaseException:
-        proc.kill()  # client went away
+        _kill_tree(proc)  # client went away
         raise
     finally:
         timer.cancel()
+        # the error text drives the resume/session-id self-heal below, so wait for it rather
+        # than racing the reader thread and treating a lost message as "no error"
+        reader.join(5)
     return result, "".join(stderr_buf)
 
 
+_prompt_cache: dict[str, tuple[tuple[int, int], str]] = {}
+
+
 def _read_prompt_file(path: str) -> str:
+    """Prompt files are live-editable, but re-reading them on every request is wasted IO: cache on (mtime, size)."""
     if not path:
         return ""
+    p = Path(path).expanduser()
     try:
-        return Path(path).expanduser().read_text().strip()
+        st = p.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+        hit = _prompt_cache.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        text = p.read_text().strip()
     except OSError as e:
         raise RuntimeError(f"cannot read --append-system-prompt-file {path}: {e}") from e
+    _prompt_cache[path] = (stamp, text)
+    return text
 
 
 def turn(body: dict, on_text, on_reasoning=None, on_tool=None):
@@ -280,7 +424,12 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None):
         return _check(res, err), None
 
     sid = session_uuid(hsid)
-    with _session_lock(sid):
+    # one turn at a time per thread (Claude sessions are not concurrent-safe), but never block
+    # for the full --timeout: a queued retry from Hermes would just pile up threads and processes
+    lock = _session_lock(sid)
+    if not lock.acquire(timeout=getattr(CFG, "queue_timeout", 120)):
+        raise Busy("this conversation is still processing the previous message")
+    try:
         state = _load_state()
         known = sid in state
         # the state file is a hint; error text below self-heals a wrong guess
@@ -309,6 +458,8 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None):
         entry["updated"] = int(time.time())
         _save_state(state)
         return out, sid
+    finally:
+        lock.release()
 
 
 def _check(res, err):
@@ -322,18 +473,21 @@ def _check(res, err):
 # -------------------------------------------------------------------------- http
 
 
-def _history_tokens(body: dict) -> int:
+def _history_tokens(body: dict, raw_len: int | None = None) -> int:
     """Rough size (4 chars/token) of the request Hermes made: its messages plus tool schemas. This is what Hermes'
     context-compression logic should be measuring. Claude Code keeps its own session, so Hermes' history is
-    never resent and its size says nothing about Claude's context."""
+    never resent and its size says nothing about Claude's context.
+    `raw_len` is the request body we already received; using it avoids re-serializing a multi-megabyte
+    history to JSON on every turn, immediately after parsing those same bytes."""
     msgs = body.get("messages") or []
-    chars = sum(len(json.dumps(m.get("content"), ensure_ascii=False)) + len(json.dumps(m.get("tool_calls") or [], ensure_ascii=False))
-                for m in msgs if isinstance(m, dict))
-    chars += len(json.dumps(body.get("tools") or [], ensure_ascii=False))
-    return chars // 4 + 4 * len(msgs)
+    if raw_len is None:
+        raw_len = sum(len(json.dumps(m.get("content"), ensure_ascii=False))
+                      + len(json.dumps(m.get("tool_calls") or [], ensure_ascii=False))
+                      for m in msgs if isinstance(m, dict)) + len(json.dumps(body.get("tools") or [], ensure_ascii=False))
+    return raw_len // 4 + 4 * len(msgs)
 
 
-def _usage(res: dict, body: dict | None = None) -> dict:
+def _usage(res: dict, body: dict | None = None, raw_len: int | None = None) -> dict:
     """OpenAI-style usage. `result.usage` from `claude -p` is the SUM over every internal model call of the run;
     each call of an agentic loop re-reads the whole cached context, so a 3-message chat that used a few tools
     reports hundreds of thousands of prompt tokens. Hermes trusts that number, thinks the conversation is
@@ -342,7 +496,7 @@ def _usage(res: dict, body: dict | None = None) -> dict:
     u = res.get("usage") or {}
     claude_in = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
     c = u.get("output_tokens") or 0
-    p = claude_in if body is None or getattr(globals().get("CFG"), "usage", "history") == "claude" else _history_tokens(body)
+    p = claude_in if body is None or getattr(CFG, "usage", "history") == "claude" else _history_tokens(body, raw_len)
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
@@ -360,9 +514,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _refuse(self) -> bool:
+        """Reject anything that is not a server-side JSON API call. The bridge runs claude with
+        --dangerously-skip-permissions, and a web page the user visits can POST to 127.0.0.1: a
+        text/plain POST is a CORS "simple request", so it is sent with no preflight. The attacker
+        cannot read the reply, but the commands have already run. Real API clients always send
+        Content-Type: application/json and never an Origin header."""
+        if self.headers.get("Origin"):
+            self._json(403, {"error": {"message": "cross-origin requests are not accepted", "type": "claude_bridge_error"}})
+            return True
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._json(415, {"error": {"message": "Content-Type must be application/json", "type": "claude_bridge_error"}})
+            return True
+        token = getattr(CFG, "auth_token", "")
+        if token and self.headers.get("Authorization", "") != "Bearer " + token:
+            self._json(401, {"error": {"message": "invalid or missing bearer token", "type": "claude_bridge_error"}})
+            return True
+        return False
+
     def do_GET(self):
         if self.path.rstrip("/") in ("/health", "/healthz"):
-            return self._json(200, {"ok": True, "sessions": len(_load_state())})
+            return self._json(200, {"ok": True, "sessions": len(_load_state()),
+                                    "session_ttl_days": getattr(CFG, "session_ttl_days", 0)})
         if self.path.rstrip("/") == "/v1/models":
             return self._json(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "claude-code"} for m in MODELS]})
         if self.path.startswith("/v1/models/") and self.path.rsplit("/", 1)[1] in MODELS:
@@ -371,33 +545,46 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
-        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))  # always drain (keep-alive)
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > CFG.max_body_mb * 1024 * 1024:
+            left = min(length, 256 * 1024 * 1024)  # drain and discard so the client gets the 413, not a reset
+            while left > 0:
+                if not self.rfile.read(min(left, 1 << 16)):
+                    break
+                left -= 1 << 16
+            self.close_connection = True
+            return self._json(413, {"error": {"message": f"body exceeds --max-body-mb ({CFG.max_body_mb})"}})
+        raw = self.rfile.read(length)  # always drain (keep-alive)
         if self.path.rstrip("/") != "/v1/chat/completions":
             return self._json(404, {"error": {"message": "not found"}})
+        if self._refuse():
+            return
         try:
             body = json.loads(raw)
         except ValueError:
             return self._json(400, {"error": {"message": "invalid JSON"}})
         cid, created, model = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), body.get("model") or CFG.model
         if body.get("stream"):
-            return self._stream(body, cid, created, model)
+            return self._stream(body, cid, created, model, len(raw))
         parts: list[str] = []
         try:
             res, sid = turn(body, parts.append)
+        except Busy as e:
+            return self._json(429, {"error": {"message": str(e), "type": "claude_bridge_busy"}})
         except Exception as e:
             return self._json(502, {"error": {"message": str(e), "type": "claude_bridge_error"}})
         text = res.get("result") or "".join(parts)
         self._json(200, {
             "id": cid, "object": "chat.completion", "created": created, "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "usage": _usage(res, body), "claude_usage": res.get("usage"), "claude_session_id": sid,
+            "usage": _usage(res, body, len(raw)), "claude_usage": res.get("usage"), "claude_session_id": sid,
         })
 
     def _sse(self, obj):
         self.wfile.write(b"data: " + (obj if isinstance(obj, bytes) else json.dumps(obj).encode()) + b"\n\n")
         self.wfile.flush()
 
-    def _stream(self, body, cid, created, model):
+    def _stream(self, body, cid, created, model, raw_len=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -430,9 +617,14 @@ class Handler(BaseHTTPRequestHandler):
                             on_tool if CFG.tool_events != "off" else None)
             if not sent and res.get("result"):
                 self._sse(chunk({"content": res["result"]}))
-            self._sse(chunk({}, "stop", usage=_usage(res, body), claude_usage=res.get("usage")))
+            self._sse(chunk({}, "stop", usage=_usage(res, body, raw_len), claude_usage=res.get("usage")))
         except (BrokenPipeError, ConnectionResetError):
             return
+        except Busy as e:
+            try:
+                self._sse(chunk({"content": f"\n[claude-bridge busy: {e}]"}, "stop"))
+            except OSError:
+                return
         except Exception as e:
             try:
                 self._sse(chunk({"content": f"\n[claude-bridge error: {e}]"}, "stop"))
@@ -476,6 +668,21 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="working dir for claude; sessions are stored per-cwd so keep it stable")
     ap.add_argument("--state-file", default=env("CLAUDE_BRIDGE_STATE", str(HERMES_HOME / "claude-bridge" / "sessions.json")))
     ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "900")))
+    ap.add_argument("--session-ttl-days", type=float, default=float(env("CLAUDE_BRIDGE_SESSION_TTL_DAYS", "7")),
+                    help="forget a thread after this many days without a message, and delete Claude Code's own "
+                         "transcript for it (default 7; 0 disables housekeeping and keeps every session forever)")
+    ap.add_argument("--max-concurrency", type=int, default=int(env("CLAUDE_BRIDGE_MAX_CONCURRENCY", "8")),
+                    help="most claude processes to run at once; further turns queue (default 8)")
+    ap.add_argument("--queue-timeout", type=float, default=float(env("CLAUDE_BRIDGE_QUEUE_TIMEOUT", "120")),
+                    help="how long a turn waits for a free slot, or for the previous turn of the same thread, "
+                         "before returning HTTP 429 (default 120s)")
+    ap.add_argument("--max-body-mb", type=float, default=float(env("CLAUDE_BRIDGE_MAX_BODY_MB", "32")),
+                    help="reject request bodies larger than this (default 32)")
+    ap.add_argument("--max-transcript-chars", type=int, default=int(env("CLAUDE_BRIDGE_MAX_TRANSCRIPT_CHARS", "200000")),
+                    help="cap on the one-time history replay when a thread joins mid-conversation (default 200000; 0 = no cap)")
+    ap.add_argument("--auth-token", default=env("CLAUDE_BRIDGE_AUTH_TOKEN", ""),
+                    help="if set, require 'Authorization: Bearer <token>'. Not needed against browser-based attacks "
+                         "(Origin and Content-Type are checked already); use it when other local users share the host")
     ap.add_argument("--usage", default=env("CLAUDE_BRIDGE_USAGE", "history"), choices=["history", "claude"],
                     help="what to report as prompt_tokens: the size of Hermes' own history (default; keeps Hermes' context "
                          "compression sane) or Claude's raw cumulative usage")
@@ -490,13 +697,16 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def main(argv=None):
-    global CFG
+    global CFG, _slots
     CFG = parse_args(argv)
+    _slots = threading.BoundedSemaphore(max(1, CFG.max_concurrency))
     srv = ThreadingHTTPServer((CFG.host, CFG.port), Handler)
     srv.daemon_threads = True
+    threading.Thread(target=_housekeeping_loop, daemon=True).start()
     print(f"[bridge] listening on http://{CFG.host}:{CFG.port}/v1  (claude={CFG.claude_bin} add_dirs={CFG.add_dir} "
           f"effort={CFG.effort or 'default'} autocompact={CFG.autocompact or 'default'} "
-          f"prompt_files={CFG.append_system_prompt_file or '-'})", file=sys.stderr)
+          f"prompt_files={CFG.append_system_prompt_file or '-'} ttl_days={CFG.session_ttl_days or 'off'} "
+          f"max_concurrency={CFG.max_concurrency} auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

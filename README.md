@@ -182,7 +182,13 @@ Every option is a flag **or** an environment variable (flag wins).
 | `--usage history\|claude` | `CLAUDE_BRIDGE_USAGE` | what to report as `prompt_tokens`. Default `history`: the size of Hermes' own conversation. `claude`: Claude's raw total, which sums every internal model call and can be hundreds of thousands of tokens for a 3-message chat, making Hermes try to compress it (see Troubleshooting). Raw numbers are always in the response as `claude_usage`. |
 | `--cwd DIR` | `CLAUDE_BRIDGE_CWD` | working directory of `claude` (default `$HERMES_HOME/claude-bridge/workspace`). Claude stores sessions **per directory**, so keep it stable. |
 | `--state-file FILE` | `CLAUDE_BRIDGE_STATE` | Hermes-session → Claude-session bookkeeping (default `$HERMES_HOME/claude-bridge/sessions.json`) |
-| `--timeout SECONDS` | `CLAUDE_BRIDGE_TIMEOUT` | kill a Claude run after this long (default 900) |
+| `--timeout SECONDS` | `CLAUDE_BRIDGE_TIMEOUT` | kill a Claude run (and everything it spawned) after this long (default 900) |
+| `--session-ttl-days N` | `CLAUDE_BRIDGE_SESSION_TTL_DAYS` | housekeeping: forget a thread after N days with no message, and delete Claude Code's own transcript for it (default `7`; `0` keeps everything forever). See below. |
+| `--max-concurrency N` | `CLAUDE_BRIDGE_MAX_CONCURRENCY` | most `claude` processes at once; further turns queue (default 8) |
+| `--queue-timeout SECONDS` | `CLAUDE_BRIDGE_QUEUE_TIMEOUT` | how long a turn waits for a free slot, or for the previous turn **of the same thread**, before returning HTTP 429 (default 120) |
+| `--max-body-mb N` | `CLAUDE_BRIDGE_MAX_BODY_MB` | reject request bodies larger than this (default 32) |
+| `--max-transcript-chars N` | `CLAUDE_BRIDGE_MAX_TRANSCRIPT_CHARS` | cap on the one-time history replay when a thread reaches the bridge mid-conversation (default 200000; `0` = no cap). Older turns are dropped first. |
+| `--auth-token TOKEN` | `CLAUDE_BRIDGE_AUTH_TOKEN` | require `Authorization: Bearer TOKEN`. Off by default; see Security. |
 | `--tool-events content\|reasoning\|off` | `CLAUDE_BRIDGE_TOOL_EVENTS` | how Claude's tool calls are shown: as `🔧 …` lines in the reply (default), as reasoning text (only visible if Hermes shows reasoning), or not at all. Streaming only. |
 | `--no-session-context` | `CLAUDE_BRIDGE_SESSION_CONTEXT=0` | do not tell Claude the platform/channel/user (see below) |
 | `--keep-memory-context` | `CLAUDE_BRIDGE_KEEP_MEMORY_CONTEXT=1` | keep the `<memory-context>` block Hermes appends to messages (see below) |
@@ -217,13 +223,18 @@ hermes-claude-cli-bridge serve \
 - Hermes appends a `<memory-context>` block (its own memory recall, cut down to a head/tail digest) to user messages. Claude Code normally has its own memory, so the bridge removes that block by default (`--keep-memory-context` keeps it).
 - File attachments arrive as a path in the message; Claude opens the file itself.
 
+**Housekeeping (`--session-ttl-days`, default 7).** Claude Code never expires a session by itself, so without this every thread the bridge ever handled would stay on disk forever. At start-up and every six hours the bridge drops threads with no message for N days, and for each one deletes Claude's own transcript (`~/.claude/projects/*/<uuid>.jsonl`, its sibling directory, and any `~/.claude/todos/<uuid>*`). Only sessions the bridge itself tracked are touched, never a session you started yourself in that directory. A dropped thread is not an error: if the same Hermes thread speaks again it simply starts a fresh Claude session. Set `--session-ttl-days 0` to keep everything.
+
+**Back-pressure.** One turn at a time per thread, and at most `--max-concurrency` Claude processes in total. A turn that cannot get a slot within `--queue-timeout` returns HTTP 429 rather than blocking for the full `--timeout`.
+
 **Claude's own setup still applies.** `claude -p` loads your normal Claude Code configuration: `CLAUDE.md`, skills, hooks, MCP servers, plugins. That is often what you want (Claude keeps its memory and tools), but it also adds tokens and start-up time to every turn. To slim it down, use `--extra-args "--setting-sources user"` (or `local`), or run the bridge as a different OS user with its own minimal Claude config.
 
 ## Security
 
 - `--dangerously-skip-permissions` means Claude can run **any command as the user running the bridge**, with no confirmation, for **anyone who can send it a chat message**. On the CLI that is you. On a **messaging gateway** it is everyone the gateway accepts messages from. Restrict who can talk to your bot (Hermes allow-lists), use a dedicated low-privilege OS user or container for the bridge, and keep secrets out of that user's reach.
 - Hermes' own tool-approval prompts do not apply: Claude uses its own tools, not Hermes'.
-- The bridge has **no authentication** and listens on `127.0.0.1` only. Do not bind it to a public interface or forward the port. Any local process can use it.
+- The bridge listens on `127.0.0.1` only. Do not bind it to a public interface or forward the port. Any local process can use it; set `--auth-token` if other people have accounts on the same machine.
+- **Browsers cannot reach it.** A page the user visits could otherwise POST to `127.0.0.1:9181` — a `text/plain` POST is a CORS "simple request", so it is sent with no preflight, and although the attacker cannot read the reply the commands have already run. The bridge therefore refuses any request carrying an `Origin` header (403) or without `Content-Type: application/json` (415), before starting Claude. Normal API clients send neither.
 - Prompt injection: anything Claude reads (web pages, files, chat text) can try to instruct it. Combined with no permission prompts, treat the bridge user as exposed.
 
 ## Limitations

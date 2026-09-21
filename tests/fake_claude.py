@@ -5,22 +5,33 @@ It understands just enough of Claude Code's flags to exercise the bridge:
   --session-id X   new session; fails with "already in use" if X exists
   --resume X       existing session; fails with "No conversation found" if X is unknown
   --no-session-persistence   nothing is stored
-The prompt is the last argument. It answers "reply[<mode>] <prompt>" as stream-json (with a huge cumulative cache_read usage, like a real tool loop), and if the prompt contains
+The prompt is read from stdin, like the real CLI when no prompt argument is given. It answers
+"reply[<mode>] <prompt>" as stream-json (with a huge cumulative cache_read usage, like a real tool loop), and if the prompt contains
 USE_TOOL it also emits a Bash tool call first. Every invocation is appended to $FAKE_CLAUDE_LOG (JSON lines).
 Known sessions live in $FAKE_CLAUDE_STATE (a JSON list).
+Set FAKE_CLAUDE_SLEEP to make a run hang, and FAKE_CLAUDE_SPAWN_CHILD=1 to leave a grandchild holding stdout
+(the case that used to wedge the bridge's read loop past its timeout).
 """
 import json
 import os
+import subprocess
 import sys
 
 argv = sys.argv[1:]
-prompt = argv[-1]
+prompt = sys.stdin.read()
 log = os.environ.get("FAKE_CLAUDE_LOG")
 state_path = os.environ.get("FAKE_CLAUDE_STATE")
 
 if log:
     with open(log, "a") as f:
-        f.write(json.dumps({"argv": argv}) + "\n")
+        f.write(json.dumps({"argv": argv, "prompt": prompt, "pgid": os.getpgid(0)}) + "\n")
+
+if os.environ.get("FAKE_CLAUDE_SPAWN_CHILD") == "1":
+    # a grandchild that inherits stdout and outlives us, exactly like a `claude` Bash tool call
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+if os.environ.get("FAKE_CLAUDE_SLEEP"):
+    import time
+    time.sleep(float(os.environ["FAKE_CLAUDE_SLEEP"]))
 
 
 def load():

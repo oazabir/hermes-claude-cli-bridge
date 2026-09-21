@@ -13,13 +13,16 @@ Starts its own bridge on a spare port with temp state, then verifies:
   9. tool-call headlines are streamed as content lines (and formatted sanely)
  10. gateway session context (platform/channel/user) reaches Claude; Hermes-only tail does not
  11. Hermes' <memory-context> block is stripped from user messages before Claude sees them
+ 12. the prompt travels on stdin, so a message far past Linux's 128 KB single-argv limit still works
+ 13. cross-origin / non-JSON POSTs are refused before claude is ever started
+ 14. /health reports the session TTL used for housekeeping
 
 The test bridge runs claude with --setting-sources local, so your own plugins/hooks (e.g. memory plugins that record
 conversations) are not loaded and the test conversations are not recorded anywhere.
 
 Needs: the `claude` CLI logged in. Costs a few cents (haiku). Run: uv run python tests/e2e_bridge.py
 """
-import json, os, subprocess, sys, tempfile, time, urllib.request
+import json, os, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -97,8 +100,28 @@ try:
           and _b._text("a <b>x</b>") == "a <b>x</b>")
     m_ans = chat("thread-D", [{"role": "user", "content": "Quote my whole message back to me exactly, in a code block, with no tools." + mem}])
     check("Claude never sees the memory-context block", "MEMMARK" not in m_ans and "Quote my whole message" in m_ans, m_ans)
+    # a single argv string is capped at 128 KB on Linux (MAX_ARG_STRLEN) whatever ARG_MAX says,
+    # so the prompt has to go on stdin; 200 KB here is comfortably past that
+    filler = ("The quick brown fox jumps over the lazy dog. " * 4600)[:200000]
+    big = chat("thread-L", [{"role": "user", "content": "Ignore this filler text, it is only padding:\n" + filler
+                             + "\n\nNow, with no tools, reply with exactly the word ELEPHANT."}])
+    check("200 KB prompt (past the argv limit) is delivered", "ELEPHANT" in big.upper(), big[:300])
+    check("prompt is not in the spawned argv", filler[:200] not in (tmp / "argv.log").read_text())
+
+    for hdrs, code in (({"content-type": "application/json", "origin": "https://evil.example"}, 403),
+                       ({"content-type": "text/plain"}, 415)):
+        try:
+            urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
+                                                          json.dumps({"messages": [{"role": "user", "content": "pwn"}]}).encode(), hdrs), timeout=30)
+            check(f"hostile POST refused ({code})", False, "request succeeded")
+        except urllib.error.HTTPError as e:
+            check(f"hostile POST refused ({code})", e.code == code, e.code)
+            e.close()
+    health = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=10))
+    check("/health reports the session TTL", health["session_ttl_days"] == 7, health)
+
     st = json.loads(state.read_text())
-    check("state: 4 sessions, thread-A turns=4", len(st) == 4 and max(v["turns"] for v in st.values()) == 4, st)
+    check("state: 5 sessions, thread-A turns=4", len(st) == 5 and max(v["turns"] for v in st.values()) == 4, st)
     state.unlink()
     h = chat("thread-A", u2 + [{"role": "assistant", "content": a2}, {"role": "user", "content": "Codeword again, one word."}])
     check("self-heal: state wiped, still resumes", "KUMQUAT" in h, h)
@@ -108,7 +131,6 @@ try:
     check("argv has --autocompact 200k", "--autocompact 200k" in argv)
     check("argv has --effort medium", "--effort medium" in argv)
     (tmp / "sys.txt").unlink()
-    import urllib.error
     try:
         chat("thread-A", u2 + [{"role": "user", "content": "x"}])
         check("missing prompt file -> 502 error, not silent", False, "request succeeded")

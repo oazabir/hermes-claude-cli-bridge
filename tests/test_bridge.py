@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -35,14 +36,17 @@ def free_port():
 class Bridge:
     """A bridge subprocess wired to the fake claude, with its own temp state."""
 
-    def __init__(self, *extra, autocompact=True):
+    def __init__(self, *extra, autocompact=True, prestate=None, **envextra):
         self.tmp = Path(tempfile.mkdtemp(prefix="bridge-test-"))
         self.port = free_port()
         self.log = self.tmp / "argv.log"
         self.fake_state = self.tmp / "fake-state.json"
         self.state = self.tmp / "sessions.json"
+        if prestate is not None:
+            self.state.write_text(json.dumps(prestate))
         (self.tmp / "sys.txt").write_text("Always answer briefly.\n")
-        env = dict(os.environ, FAKE_CLAUDE_LOG=str(self.log), FAKE_CLAUDE_STATE=str(self.fake_state), PYTHONPATH=str(SRC))
+        env = dict(os.environ, FAKE_CLAUDE_LOG=str(self.log), FAKE_CLAUDE_STATE=str(self.fake_state), PYTHONPATH=str(SRC),
+                   **envextra)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "hermes_claude_cli_bridge", "serve", "--port", str(self.port), "--claude-bin", str(FAKE), "--model", "sonnet",
              "--cwd", str(self.tmp / "ws"), "--state-file", str(self.state), "--add-dir", str(self.tmp),
@@ -60,13 +64,15 @@ class Bridge:
     def get(self, path):
         return json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=10))
 
-    def post(self, messages, session=None, stream=False, **body):
+    def raw_post(self, data: bytes, headers: dict, timeout=30):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions", data, headers)
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def post(self, messages, session=None, stream=False, timeout=30, headers=None, **body):
         payload = {"model": "sonnet", "stream": stream, "messages": messages, **body}
         if session:
             payload["claude_bridge"] = {"session_id": session}
-        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions", json.dumps(payload).encode(),
-                                     {"content-type": "application/json"})
-        r = urllib.request.urlopen(req, timeout=30)
+        r = self.raw_post(json.dumps(payload).encode(), headers or {"content-type": "application/json"}, timeout)
         if not stream:
             return json.load(r)
         chunks, raw = [], r.read().decode()
@@ -81,6 +87,9 @@ class Bridge:
 
     def calls(self):
         return [json.loads(l)["argv"] for l in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def prompts(self):
+        return [json.loads(l)["prompt"] for l in self.log.read_text().splitlines()] if self.log.exists() else []
 
     def stop(self):
         self.proc.terminate()
@@ -218,6 +227,169 @@ class BridgeTests(unittest.TestCase):
             chunks, _ = b.post([{"role": "user", "content": "USE_TOOL"}], "t", stream=True)
             text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
             self.assertNotIn("🔧", text)
+        finally:
+            b.stop()
+
+
+class HardeningTests(unittest.TestCase):
+    """The fixes from the 2026-09-21 review: argv limit, process groups, CSRF, limits, housekeeping."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.b = Bridge()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.b.stop()
+
+    def setUp(self):
+        self.b.log.write_text("")
+
+    def test_prompt_goes_on_stdin_not_argv(self):
+        # Linux caps ONE argv string at 128 KB (MAX_ARG_STRLEN) whatever ARG_MAX says
+        big = "x" * 300_000
+        out = self.b.chat(big, "thread-big")
+        self.assertIn("reply[new]", out)
+        (argv,), (prompt,) = self.b.calls(), self.b.prompts()
+        self.assertNotIn(big, " ".join(argv), "the prompt must not be an argument")
+        self.assertIn(big, prompt)
+
+    def test_timeout_kills_the_whole_process_group(self):
+        b = Bridge("--timeout", "2", FAKE_CLAUDE_SLEEP="60", FAKE_CLAUDE_SPAWN_CHILD="1")
+        try:
+            started = time.time()
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                b.chat("hang", "t", timeout=40)
+            cm.exception.close()
+            # before the fix the orphaned grandchild held stdout open and the read loop never ended
+            self.assertLess(time.time() - started, 25, "timeout must actually end the turn")
+        finally:
+            b.stop()
+
+    def test_cross_origin_post_is_refused(self):
+        payload = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "pwn"}]}).encode()
+        for headers, code in (({"content-type": "application/json", "origin": "https://evil.example"}, 403),
+                              ({"content-type": "text/plain"}, 415)):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.b.raw_post(payload, headers)
+            self.assertEqual(cm.exception.code, code)
+            cm.exception.close()
+        self.assertEqual(self.b.calls(), [], "a refused request must never reach claude")
+
+    def test_auth_token_is_enforced_when_set(self):
+        b = Bridge("--auth-token", "s3cret")
+        try:
+            payload = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}).encode()
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                b.raw_post(payload, {"content-type": "application/json"})
+            self.assertEqual(cm.exception.code, 401)
+            cm.exception.close()
+            r = b.raw_post(payload, {"content-type": "application/json", "authorization": "Bearer s3cret"})
+            self.assertEqual(r.status, 200)
+        finally:
+            b.stop()
+
+    def test_oversized_body_is_rejected(self):
+        b = Bridge("--max-body-mb", "1")
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                b.chat("y" * 2_000_000, "t")
+            self.assertEqual(cm.exception.code, 413)
+            cm.exception.close()
+        finally:
+            b.stop()
+
+    def test_concurrency_cap_returns_429_instead_of_forking_forever(self):
+        b = Bridge("--max-concurrency", "1", "--queue-timeout", "1", FAKE_CLAUDE_SLEEP="4")
+        codes = []
+
+        def hit(n):
+            try:
+                b.chat("hi", f"thread-{n}", timeout=30)
+                codes.append(200)
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+                e.close()
+
+        try:
+            ts = [threading.Thread(target=hit, args=(n,)) for n in range(3)]
+            [t.start() for t in ts]
+            [t.join(40) for t in ts]
+            self.assertIn(429, codes, codes)
+            self.assertIn(200, codes, codes)
+        finally:
+            b.stop()
+
+    def test_same_thread_second_message_gets_429_not_a_15_minute_block(self):
+        b = Bridge("--queue-timeout", "1", FAKE_CLAUDE_SLEEP="4")
+        codes = []
+
+        def hit():
+            try:
+                b.chat("hi", "same-thread", timeout=30)
+                codes.append(200)
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+                e.close()
+
+        try:
+            t = threading.Thread(target=hit)
+            t.start()
+            time.sleep(1)
+            hit()
+            t.join(30)
+            self.assertIn(429, codes, codes)
+        finally:
+            b.stop()
+
+    def test_expired_sessions_are_pruned_with_their_claude_transcripts(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bridge-ttl-"))
+        old_sid, fresh_sid = "11111111-1111-5111-8111-111111111111", "22222222-2222-5222-8222-222222222222"
+        proj = tmp / "claude" / "projects" / "-ws"
+        proj.mkdir(parents=True)
+        for sid in (old_sid, fresh_sid):
+            (proj / f"{sid}.jsonl").write_text("{}")
+        now = int(time.time())
+        b = Bridge("--session-ttl-days", "7", CLAUDE_CONFIG_DIR=str(tmp / "claude"),
+                   prestate={old_sid: {"updated": now - 8 * 86400, "turns": 1},
+                             fresh_sid: {"updated": now - 3600, "turns": 1}})
+        try:
+            for _ in range(30):
+                if b.get("/health")["sessions"] == 1:
+                    break
+                time.sleep(0.1)
+            health = b.get("/health")
+            self.assertEqual(health["sessions"], 1, "the idle session should be gone")
+            self.assertEqual(health["session_ttl_days"], 7)
+            self.assertEqual(set(json.loads(b.state.read_text())), {fresh_sid})
+            self.assertFalse((proj / f"{old_sid}.jsonl").exists(), "claude's own transcript must be deleted too")
+            self.assertTrue((proj / f"{fresh_sid}.jsonl").exists(), "an active session must be left alone")
+        finally:
+            b.stop()
+
+    def test_ttl_zero_keeps_everything(self):
+        old = {"33333333-3333-5333-8333-333333333333": {"updated": int(time.time()) - 900 * 86400}}
+        b = Bridge("--session-ttl-days", "0", prestate=old)
+        try:
+            time.sleep(0.5)
+            self.assertEqual(b.get("/health")["sessions"], 1)
+        finally:
+            b.stop()
+
+    def test_mid_thread_transcript_is_capped(self):
+        b = Bridge("--max-transcript-chars", "2000")
+        try:
+            history = []
+            for i in range(200):
+                history += [{"role": "user", "content": f"old question {i} " + "z" * 200},
+                            {"role": "assistant", "content": f"old answer {i}"}]
+            b.chat("the new one", "thread-cap", history)
+            (prompt,) = b.prompts()
+            self.assertIn("the new one", prompt)
+            self.assertIn("older messages omitted", prompt)
+            self.assertNotIn("old question 0 ", prompt, "the oldest turns are dropped, not the newest")
+            self.assertIn("old question 199", prompt)
+            self.assertLess(len(prompt), 6000)
         finally:
             b.stop()
 
