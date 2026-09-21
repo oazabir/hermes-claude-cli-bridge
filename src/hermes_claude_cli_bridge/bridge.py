@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Hermes -> Claude Code CLI bridge.
 
 An OpenAI-compatible /v1/chat/completions server (stdlib only) that answers each
@@ -433,7 +432,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def parse_args(argv=None) -> argparse.Namespace:
     env = os.environ.get
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="hermes-claude-cli-bridge serve", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default=env("CLAUDE_BRIDGE_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(env("CLAUDE_BRIDGE_PORT", "9181")))
     ap.add_argument("--claude-bin", default=env("CLAUDE_BIN", "claude"))

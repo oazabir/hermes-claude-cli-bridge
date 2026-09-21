@@ -17,7 +17,7 @@ Starts its own bridge on a spare port with temp state, then verifies:
 The test bridge runs claude with --setting-sources local, so your own plugins/hooks (e.g. memory plugins that record
 conversations) are not loaded and the test conversations are not recorded anywhere.
 
-Needs: the `claude` CLI logged in. Costs a few cents (haiku). Run: python3 tests/e2e_bridge.py
+Needs: the `claude` CLI logged in. Costs a few cents (haiku). Run: uv run python tests/e2e_bridge.py
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
@@ -34,10 +34,10 @@ shim = tmp / "claude-shim"  # records argv, then execs the real claude
 shim.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {tmp}/argv.log\nexec {os.popen("command -v claude").read().strip()} "$@"\n')
 shim.chmod(0o755)
 
-srv = subprocess.Popen([sys.executable, str(HERE / "bridge/claude_hermes_bridge.py"), "--port", str(PORT), "--model", "haiku",
+srv = subprocess.Popen([sys.executable, "-m", "hermes_claude_cli_bridge", "serve", "--port", str(PORT), "--model", "haiku",
                         "--claude-bin", str(shim), "--add-dir", str(tmp / "extra"), "--autocompact", "200k",
                         "--append-system-prompt-file", str(tmp / "sys.txt"), "--append-system-prompt-file", str(tmp / "sys2.txt"), "--effort", "medium",
-                        "--cwd", str(tmp / "ws"), "--state-file", str(state), "--extra-args", "--setting-sources local"], stderr=open(tmp / "bridge.log", "w"))
+                        "--cwd", str(tmp / "ws"), "--state-file", str(state), "--extra-args", "--setting-sources local"], stderr=open(tmp / "bridge.log", "w"), env=dict(os.environ, PYTHONPATH=str(HERE / "src")))
 time.sleep(1.5)
 
 
@@ -56,8 +56,8 @@ def chat(session, msgs, stream=False):
 
 
 fails = []
-sys.path.insert(0, str(HERE / "bridge"))
-import claude_hermes_bridge as _b
+sys.path.insert(0, str(HERE / "src"))
+from hermes_claude_cli_bridge import bridge as _b
 def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name, "" if ok else f"-> {detail!r}")
     if not ok: fails.append(name)

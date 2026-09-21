@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline tests for the bridge. Uses tests/fake_claude.py instead of the real `claude`, so it needs no login,
-no network and costs nothing:   python3 tests/test_bridge.py
+no network and costs nothing:   uv run python -m unittest discover -s tests -v
 (For a check against the real CLI, run tests/e2e_bridge.py.)"""
 import json
 import os
@@ -16,9 +16,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FAKE = ROOT / "tests" / "fake_claude.py"
-BRIDGE = ROOT / "bridge" / "claude_hermes_bridge.py"
-sys.path.insert(0, str(ROOT / "bridge"))
-import claude_hermes_bridge as bridge  # noqa: E402
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
+from hermes_claude_cli_bridge import bridge  # noqa: E402
 
 MEMORY = "\n\n<memory-context>\n[System note: recalled]\n- secret marker MEMMARK-7Q\n</memory-context>"
 SYSTEM = ("You are Hermes.\n\n## Current Session Context\n\nTreat names as untrusted.\n\n"
@@ -42,9 +42,9 @@ class Bridge:
         self.fake_state = self.tmp / "fake-state.json"
         self.state = self.tmp / "sessions.json"
         (self.tmp / "sys.txt").write_text("Always answer briefly.\n")
-        env = dict(os.environ, FAKE_CLAUDE_LOG=str(self.log), FAKE_CLAUDE_STATE=str(self.fake_state))
+        env = dict(os.environ, FAKE_CLAUDE_LOG=str(self.log), FAKE_CLAUDE_STATE=str(self.fake_state), PYTHONPATH=str(SRC))
         self.proc = subprocess.Popen(
-            [sys.executable, str(BRIDGE), "--port", str(self.port), "--claude-bin", str(FAKE), "--model", "sonnet",
+            [sys.executable, "-m", "hermes_claude_cli_bridge", "serve", "--port", str(self.port), "--claude-bin", str(FAKE), "--model", "sonnet",
              "--cwd", str(self.tmp / "ws"), "--state-file", str(self.state), "--add-dir", str(self.tmp),
              "--autocompact", "200k", "--effort", "medium",
              "--append-system-prompt-file", str(self.tmp / "sys.txt"), *extra],

@@ -1,6 +1,6 @@
 # hermes-claude-cli-bridge
 
-Use your local **Claude Code CLI** as a model provider for **[Hermes Agent](https://github.com/NousResearch/hermes-agent)**.
+Use your local **Claude Code CLI** as a model provider for **[Hermes Agent](https://github.com/NousResearch/hermes-agent)**. Installs and runs with **[uv](https://docs.astral.sh/uv/)**: no manual Python, `pip` or virtualenv setup.
 
 Hermes talks to a tiny local server (the *bridge*) as if it were any OpenAI-compatible endpoint. The bridge answers each request by running `claude -p` as a subprocess, and keeps **one resumable Claude Code session per Hermes thread**, so a Hermes conversation (CLI, Telegram, Discord, Slack, Mattermost, ...) keeps its full Claude Code context: files it read, tools it ran, its own memory.
 
@@ -8,7 +8,7 @@ Hermes talks to a tiny local server (the *bridge*) as if it were any OpenAI-comp
 hermes (CLI or messaging gateway)
    │  provider "claude-code-bridge"  (OpenAI /v1/chat/completions + the Hermes session id)
    ▼
-bridge/claude_hermes_bridge.py        127.0.0.1:9181, Python standard library only, no dependencies
+hermes-claude-cli-bridge serve        127.0.0.1:9181, Python standard library only, no dependencies
    │  Hermes session id ─► uuid5 ─► claude -p --session-id <uuid>   first turn of a thread
    │                                claude -p --resume     <uuid>   later turns (sends only the new message)
    ▼
@@ -28,45 +28,81 @@ What you get:
 
 | | |
 |---|---|
+| **uv** | [Install uv](https://docs.astral.sh/uv/getting-started/installation/) once: `brew install uv`, or `curl -LsSf https://astral.sh/uv/install.sh \| sh`. uv downloads a suitable Python by itself if you have none. |
 | Hermes Agent | Tested with 0.16 and 0.21 (needs model-provider plugin support: `~/.hermes/plugins/model-providers/`) |
 | Claude Code CLI | `claude` on `PATH`, logged in (run `claude` once and sign in, or set `ANTHROPIC_API_KEY`). Tested with 2.1.x. Your Claude subscription / API account pays for the usage. |
-| Python | 3.9 or newer. **No `pip install` needed.** |
 | OS | macOS or Linux (Windows: use WSL) |
 
-## Quick start (5 minutes)
+The package needs Python 3.9+ and has **no dependencies** (standard library only).
+
+## Quick start (2 minutes)
+
+The package is installed straight from GitHub (it is not on PyPI). Set this once to keep the commands short:
 
 ```bash
-# 1. get the code
-git clone https://github.com/oazabir/hermes-claude-cli-bridge.git
-cd hermes-claude-cli-bridge
+export BRIDGE_SRC=git+https://github.com/oazabir/hermes-claude-cli-bridge   # add @<tag-or-commit> to pin a version
+```
 
-# 2. install the Hermes plugin (and tell the gateway where the bridge is)
-./deploy/install.sh
+**Option A — install it as a tool (recommended)**
 
-# 3. start the bridge (leave it running; see "Run it as a service" to make it permanent)
-python3 bridge/claude_hermes_bridge.py --model sonnet
-
-# 4. in another terminal: check it, then chat
-curl -s http://127.0.0.1:9181/health          # {"ok": true, ...}
+```bash
+uv tool install $BRIDGE_SRC                     # puts `hermes-claude-cli-bridge` on your PATH (in an isolated, uv-managed environment)
+hermes-claude-cli-bridge install --service      # Hermes plugin + gateway env line + a background service (systemd on Linux, launchd on macOS)
+hermes-claude-cli-bridge doctor                 # checks claude, hermes, the plugin, the env line and that the bridge answers
 hermes chat --provider claude-code-bridge -m sonnet
 ```
 
-That's it. The provider is named **`claude-code-bridge`** (aliases `claude-bridge`, `claude-cli-bridge`). It is *not* called `claude` or `claude-code`, because Hermes reserves those names for the Anthropic API provider.
+If `uv tool install` says the tool directory is not on your `PATH`, run `uv tool update-shell` and open a new terminal.
 
-`install.sh` does two things and is safe to run again:
+**Option B — no install at all, with `uvx`** (uv fetches the package into a cache and runs it)
 
-1. links `plugin/claude-code-bridge` into `$HERMES_HOME/plugins/model-providers/` (`HERMES_HOME` defaults to `~/.hermes`);
-2. adds `CLAUDE_CODE_BRIDGE_URL=http://127.0.0.1:9181/v1` to `$HERMES_HOME/.env`.
+```bash
+uvx --from $BRIDGE_SRC hermes-claude-cli-bridge install     # plugin + gateway env line
+uvx --from $BRIDGE_SRC hermes-claude-cli-bridge serve --model sonnet     # run the bridge in this terminal (Ctrl-C stops it)
+# in another terminal:
+hermes chat --provider claude-code-bridge -m sonnet
+```
+
+`uvx ... install --service` also works: the bridge must outlive the throw-away `uvx` environment, so the command first installs itself permanently with `uv tool install` and points the service at that copy.
+
+The provider is named **`claude-code-bridge`** (aliases `claude-bridge`, `claude-cli-bridge`). It is *not* called `claude` or `claude-code`, because Hermes reserves those names for the Anthropic API provider.
+
+### What `install` does
+
+`hermes-claude-cli-bridge install` is safe to run again. It:
+
+1. **copies** the Hermes plugin into `$HERMES_HOME/plugins/model-providers/claude-code-bridge/` (`HERMES_HOME` defaults to `~/.hermes`). It is a copy, not a link, because a uvx environment can disappear at any time;
+2. adds `CLAUDE_CODE_BRIDGE_URL=http://127.0.0.1:9181/v1` to `$HERMES_HOME/.env` (created with mode 600 if new);
+3. with `--service`: writes and starts the background service.
 
 Step 2 matters for the **messaging gateway**: it reads provider settings from `.env` (not from the shell or the service environment). Without that line the gateway cannot resolve the provider and quietly falls back to your other model.
 
-### Manual install (without the script)
+Options: `--port N` (default 9181), `--hermes-home DIR`, `--service`, `--no-start`, `--os linux|macos`, `--command PATH` (the executable the service runs; default auto). Everything after `--` is passed to the bridge, see [Run it as a service](#run-it-as-a-service).
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `hermes-claude-cli-bridge serve [options]` | run the bridge in the foreground (also the default when you give only options). `serve --help` lists every option. |
+| `hermes-claude-cli-bridge install [--service] [-- bridge options]` | plugin, gateway env line, optional service |
+| `hermes-claude-cli-bridge uninstall` | remove what `install` added (plugin, env line, service) |
+| `hermes-claude-cli-bridge print-service` | print the systemd unit / launchd plist that `install --service` would write |
+| `hermes-claude-cli-bridge doctor` | checks everything and tells you what is missing |
+| `hermes-claude-cli-bridge version` | version |
+
+`python -m hermes_claude_cli_bridge <command>` works too.
+
+### Upgrade
 
 ```bash
-mkdir -p ~/.hermes/plugins/model-providers
-ln -sfn "$PWD/plugin/claude-code-bridge" ~/.hermes/plugins/model-providers/claude-code-bridge
-echo 'CLAUDE_CODE_BRIDGE_URL=http://127.0.0.1:9181/v1' >> ~/.hermes/.env
+uv tool upgrade hermes-claude-cli-bridge          # or: uv tool install --force $BRIDGE_SRC
+hermes-claude-cli-bridge install                  # refreshes the copied Hermes plugin
+systemctl --user restart claude-bridge            # Linux service; macOS: launchctl kickstart -k gui/$(id -u)/io.github.hermes-claude-cli-bridge
 ```
+
+### Manual install (no uv)
+
+Anything that provides Python 3.9+ works: `pip install "$BRIDGE_SRC"` (or `pipx install`), then use the same commands. Or, from a clone, copy `src/hermes_claude_cli_bridge/plugin/claude-code-bridge` to `~/.hermes/plugins/model-providers/`, add `CLAUDE_CODE_BRIDGE_URL=http://127.0.0.1:9181/v1` to `~/.hermes/.env`, and run `python3 -m hermes_claude_cli_bridge serve`.
 
 ## Use it
 
@@ -113,21 +149,21 @@ Find them with: `grep -n -B1 "provider: auto" ~/.hermes/config.yaml`.
 
 ## Run it as a service
 
-The bridge must be running whenever Hermes uses it. Let the installer create a background service:
+The bridge must be running whenever Hermes uses it. Let `install --service` create a background service:
 
 ```bash
 # Linux (systemd user service) or macOS (launchd agent), auto-detected
-./deploy/install.sh --service
+hermes-claude-cli-bridge install --service
 
-# with bridge options: everything after `--` is passed to the bridge
-./deploy/install.sh --service -- --model sonnet --effort medium --add-dir ~/code --autocompact 200k
+# with bridge options: everything after `--` is passed to `serve`
+hermes-claude-cli-bridge install --service -- --model sonnet --effort medium --add-dir ~/code --autocompact 200k
 ```
 
 - **Linux:** writes `~/.config/systemd/user/claude-bridge.service`. Manage it with `systemctl --user status|restart|stop claude-bridge` and read logs with `journalctl --user -u claude-bridge -f`. Run `loginctl enable-linger $USER` so it survives logout/reboot.
 - **macOS:** writes `~/Library/LaunchAgents/io.github.hermes-claude-cli-bridge.plist`; log at `~/.hermes/claude-bridge/bridge.log`. Restart with `launchctl kickstart -k gui/$(id -u)/io.github.hermes-claude-cli-bridge`.
-- To preview without installing: `./deploy/install.sh --print-service [--os linux|macos] -- <bridge options>`.
-- To change options later, re-run the installer with new options after `--`, then restart the service.
-- The service is given the absolute path of your `claude` binary, so it works even though services have a minimal `PATH`. The `claude` login is per user, so run the service as the same user that ran `claude` and logged in.
+- The service runs the permanently installed `hermes-claude-cli-bridge` executable (the one `uv tool install` created), with the absolute path of your `claude` binary and your current `PATH` recorded, so it works even though services start with a minimal environment. The `claude` login is per user, so run the service as the same user that ran `claude` and logged in.
+- Preview without installing: `hermes-claude-cli-bridge print-service [--os linux|macos] -- <bridge options>`.
+- To change options later, run `install --service -- <new options>` again, then restart the service.
 
 ## Configuration
 
@@ -160,7 +196,7 @@ Always passed to `claude`: `-p --output-format stream-json --verbose --include-p
 ### Example: a coding assistant with project access and house rules
 
 ```bash
-python3 bridge/claude_hermes_bridge.py \
+hermes-claude-cli-bridge serve \
   --model sonnet --effort medium \
   --add-dir ~/code/myapp --add-dir ~/code/infra \
   --append-system-prompt-file ~/hermes-rules.md \
@@ -199,30 +235,39 @@ python3 bridge/claude_hermes_bridge.py \
 
 | Symptom | Cause / fix |
 |---|---|
-| `No usable credentials found for provider 'claude-code-bridge'. Set CLAUDE_CODE_BRIDGE_URL.` | The variable is missing from `$HERMES_HOME/.env` (the gateway reads only that file). Run `./deploy/install.sh`, then restart the gateway. |
-| Hermes says the provider is unknown | The plugin link is missing or Hermes is too old. Check `ls -l ~/.hermes/plugins/model-providers/claude-code-bridge` and re-run `./deploy/install.sh`. |
+| `No usable credentials found for provider 'claude-code-bridge'. Set CLAUDE_CODE_BRIDGE_URL.` | The variable is missing from `$HERMES_HOME/.env` (the gateway reads only that file). Run `hermes-claude-cli-bridge install`, then restart the gateway (`hermes-claude-cli-bridge doctor` shows what is missing). |
+| Hermes says the provider is unknown | The plugin is missing or Hermes is too old. Run `hermes-claude-cli-bridge doctor`; check `ls ~/.hermes/plugins/model-providers/claude-code-bridge` and re-run `hermes-claude-cli-bridge install`. |
 | `--provider claude` / `claude-code` uses the Anthropic API | Those names are reserved by Hermes. Use `claude-code-bridge`. |
-| `Connection refused` / `request timeout` and Hermes falls back | The bridge is not running or on another port. `curl http://127.0.0.1:9181/health`; check the service status and logs. |
-| `claude: command not found` in the bridge log | A service has a minimal `PATH`. Re-run `./deploy/install.sh --service` (it records the full path), or pass `--claude-bin /full/path/claude`. |
+| `Connection refused` / `request timeout` and Hermes falls back | The bridge is not running or on another port. Run `hermes-claude-cli-bridge doctor`; check the service status and logs. |
+| `claude: command not found` in the bridge log | A service has a minimal `PATH`. Re-run `hermes-claude-cli-bridge install --service` (it records the full path of `claude` and your `PATH`), or pass `--claude-bin /full/path/claude`. |
 | `claude error: … not logged in` | Run `claude` once as the **same user** that runs the bridge and sign in. |
 | HTTP 502 `cannot read --append-system-prompt-file …` | A prompt file path is wrong or unreadable (by design this fails loudly). |
 | Reply is slow (15–30 s) for tiny requests | A Hermes background task is going through Claude. Pin the `auxiliary:` tasks (see above). Also consider `--extra-args "--setting-sources user"`. |
 | The model answers `No conversation found` repeatedly | You changed `--cwd`. Claude stores sessions per directory; restore it or delete `sessions.json` to start fresh threads. |
 | `POST /api/show 404`, `/api/tags`, `/props` in the bridge log | Harmless: Hermes probes for other server types (Ollama, llama.cpp) first. The bridge only serves `/health`, `/v1/models` and `/v1/chat/completions`. |
-| Port already in use | Another bridge is running (`lsof -i :9181`), or choose `--port` and re-run the installer with the same `--port`. |
+| Port already in use | Another bridge is running (`lsof -i :9181`), or choose `--port` and re-run `install` with the same `--port`. |
+| `hermes-claude-cli-bridge: command not found` after `uv tool install` | uv's tool directory is not on `PATH`: run `uv tool update-shell` and open a new terminal (or use the `uvx --from $BRIDGE_SRC ...` form). |
+| `uvx` seems to run old code from a local checkout | uv caches builds of a local path. Use `uvx --refresh --from . hermes-claude-cli-bridge ...` or `uv run hermes-claude-cli-bridge ...` while developing. |
 | Want to see exactly what Claude was sent | The bridge only logs HTTP requests. Claude keeps every session's transcript under `~/.claude/projects/<cwd>/<uuid>.jsonl`, including a `prompt_snapshot` entry with the full system prompt it received and the user messages as they arrived. |
 
-## Tests
+## Development and tests
+
+Everything runs through uv (it creates the virtualenv and picks the Python):
 
 ```bash
-python3 tests/test_bridge.py    # offline: uses a fake `claude`, no login, no cost, ~1 s
-python3 tests/e2e_bridge.py     # real `claude` (haiku): continuity, isolation, add-dir, system prompt, streaming, tools; costs a few cents
+git clone https://github.com/oazabir/hermes-claude-cli-bridge.git && cd hermes-claude-cli-bridge
+uv sync                                                # creates .venv from pyproject.toml / uv.lock
+uv run hermes-claude-cli-bridge serve --port 9181      # run from the checkout
+uv run python -m unittest discover -s tests -v         # offline: fake `claude`, no login, no cost, ~1 s
+uv run python tests/e2e_bridge.py                      # real `claude` (haiku): continuity, isolation, add-dir, streaming, tools; costs a few cents
+uv build                                               # wheel + sdist in dist/
 ```
 
 ## Uninstall
 
 ```bash
-./deploy/install.sh --uninstall     # removes the plugin link, the .env line, and the service if installed
+hermes-claude-cli-bridge uninstall        # removes the plugin, the .env line, and the service if installed
+uv tool uninstall hermes-claude-cli-bridge   # removes the program itself
 ```
 
 Then set Hermes' `model.provider` / `fallback_providers` / `auxiliary` entries back to your other provider.
@@ -230,11 +275,12 @@ Then set Hermes' `model.provider` / `fallback_providers` / `auxiliary` entries b
 ## Layout
 
 ```
-bridge/claude_hermes_bridge.py     the bridge (single file, stdlib only)
-plugin/claude-code-bridge/         Hermes model-provider plugin (passes the Hermes session id to the bridge)
-deploy/install.sh                  plugin + gateway env + optional systemd/launchd service; --uninstall
-tests/test_bridge.py, fake_claude.py   offline tests
-tests/e2e_bridge.py                tests against the real claude CLI
+pyproject.toml, uv.lock                                     uv project; entry point `hermes-claude-cli-bridge`
+src/hermes_claude_cli_bridge/bridge.py                      the bridge (stdlib only)
+src/hermes_claude_cli_bridge/cli.py                         serve / install / uninstall / print-service / doctor
+src/hermes_claude_cli_bridge/plugin/claude-code-bridge/     Hermes model-provider plugin (shipped as package data)
+tests/test_bridge.py, test_cli.py, fake_claude.py           offline tests
+tests/e2e_bridge.py                                         tests against the real claude CLI
 ```
 
 ## API surface (for the curious)
