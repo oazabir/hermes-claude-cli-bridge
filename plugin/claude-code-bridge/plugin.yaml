@@ -1,0 +1,4 @@
+name: claude-code-bridge-provider
+kind: model-provider
+version: 0.1.0
+description: "Claude Code CLI as a Hermes model provider, one resumable claude session per Hermes thread (needs claude_hermes_bridge.py on :9181)."
