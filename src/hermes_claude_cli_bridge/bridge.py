@@ -322,10 +322,27 @@ def _check(res, err):
 # -------------------------------------------------------------------------- http
 
 
-def _usage(res: dict) -> dict:
+def _history_tokens(body: dict) -> int:
+    """Rough size (4 chars/token) of the request Hermes made: its messages plus tool schemas. This is what Hermes'
+    context-compression logic should be measuring. Claude Code keeps its own session, so Hermes' history is
+    never resent and its size says nothing about Claude's context."""
+    msgs = body.get("messages") or []
+    chars = sum(len(json.dumps(m.get("content"), ensure_ascii=False)) + len(json.dumps(m.get("tool_calls") or [], ensure_ascii=False))
+                for m in msgs if isinstance(m, dict))
+    chars += len(json.dumps(body.get("tools") or [], ensure_ascii=False))
+    return chars // 4 + 4 * len(msgs)
+
+
+def _usage(res: dict, body: dict | None = None) -> dict:
+    """OpenAI-style usage. `result.usage` from `claude -p` is the SUM over every internal model call of the run;
+    each call of an agentic loop re-reads the whole cached context, so a 3-message chat that used a few tools
+    reports hundreds of thousands of prompt tokens. Hermes trusts that number, thinks the conversation is
+    enormous, and tries (uselessly) to compress it, so by default report the size of Hermes' own history instead.
+    The raw Claude numbers are still returned as `claude_usage`; `--usage claude` reports them as usage."""
     u = res.get("usage") or {}
-    p = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
+    claude_in = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
     c = u.get("output_tokens") or 0
+    p = claude_in if body is None or getattr(globals().get("CFG"), "usage", "history") == "claude" else _history_tokens(body)
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
@@ -373,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {
             "id": cid, "object": "chat.completion", "created": created, "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "usage": _usage(res), "claude_session_id": sid,
+            "usage": _usage(res, body), "claude_usage": res.get("usage"), "claude_session_id": sid,
         })
 
     def _sse(self, obj):
@@ -413,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
                             on_tool if CFG.tool_events != "off" else None)
             if not sent and res.get("result"):
                 self._sse(chunk({"content": res["result"]}))
-            self._sse(chunk({}, "stop", usage=_usage(res)))
+            self._sse(chunk({}, "stop", usage=_usage(res, body), claude_usage=res.get("usage")))
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as e:
@@ -445,7 +462,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="file appended to the system prompt, in order (repeatable; env os.pathsep-separated); re-read every request")
     ap.add_argument("--effort", default=env("CLAUDE_BRIDGE_EFFORT", "medium"), choices=["", "low", "medium", "high", "xhigh", "max"],
                     help="passed as --effort (default medium; '' = claude default)")
-    ap.add_argument("--autocompact", default=env("CLAUDE_BRIDGE_AUTOCOMPACT", ""), help="'auto' or 100k-1M tokens")
+    ap.add_argument("--autocompact", default=env("CLAUDE_BRIDGE_AUTOCOMPACT", "auto"),
+                    help="Claude Code's own context compaction: 'auto' (default) or a threshold such as 200k (100k-1M); "
+                         "'' passes nothing. Hermes' compression cannot shrink Claude's session, so this is what keeps long threads working")
     ap.add_argument("--keep-memory-context", action="store_true", default=env("CLAUDE_BRIDGE_KEEP_MEMORY_CONTEXT") == "1",
                     help="keep the <memory-context> recall block Hermes appends to user messages (default: strip it)")
     ap.add_argument("--no-session-context", dest="session_context", action="store_false",
@@ -457,6 +476,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="working dir for claude; sessions are stored per-cwd so keep it stable")
     ap.add_argument("--state-file", default=env("CLAUDE_BRIDGE_STATE", str(HERMES_HOME / "claude-bridge" / "sessions.json")))
     ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "900")))
+    ap.add_argument("--usage", default=env("CLAUDE_BRIDGE_USAGE", "history"), choices=["history", "claude"],
+                    help="what to report as prompt_tokens: the size of Hermes' own history (default; keeps Hermes' context "
+                         "compression sane) or Claude's raw cumulative usage")
     ap.add_argument("--tool-events", default=env("CLAUDE_BRIDGE_TOOL_EVENTS", "content"), choices=["content", "reasoning", "off"],
                     help="show Claude's tool calls to Hermes as one-line headlines: in the reply (content), in reasoning, or not at all")
     ap.add_argument("--extra-args", default=env("CLAUDE_BRIDGE_EXTRA_ARGS", ""), help="raw extra claude flags (shlex-split)")

@@ -35,7 +35,7 @@ def free_port():
 class Bridge:
     """A bridge subprocess wired to the fake claude, with its own temp state."""
 
-    def __init__(self, *extra):
+    def __init__(self, *extra, autocompact=True):
         self.tmp = Path(tempfile.mkdtemp(prefix="bridge-test-"))
         self.port = free_port()
         self.log = self.tmp / "argv.log"
@@ -46,7 +46,7 @@ class Bridge:
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "hermes_claude_cli_bridge", "serve", "--port", str(self.port), "--claude-bin", str(FAKE), "--model", "sonnet",
              "--cwd", str(self.tmp / "ws"), "--state-file", str(self.state), "--add-dir", str(self.tmp),
-             "--autocompact", "200k", "--effort", "medium",
+             *(["--autocompact", "200k"] if autocompact else []), "--effort", "medium",
              "--append-system-prompt-file", str(self.tmp / "sys.txt"), *extra],
             env=env, stderr=subprocess.DEVNULL)
         for _ in range(50):
@@ -165,6 +165,35 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("test-channel", appended)
         self.assertNotIn("LEAKMARK", appended)
         self.assertNotIn("hermes-only", appended)
+
+    def test_usage_reports_hermes_history_not_claudes_cumulative_total(self):
+        r = self.b.post([{"role": "user", "content": "tiny"}], "thread-usage")
+        self.assertLess(r["usage"]["prompt_tokens"], 1000, "a tiny chat must not look huge (it would trigger useless compression in Hermes)")
+        self.assertEqual(r["claude_usage"]["cache_read_input_tokens"], 700000, "raw Claude numbers stay available")
+        big = self.b.post([{"role": "user", "content": "x" * 40000}], "thread-usage2")
+        self.assertTrue(9000 < big["usage"]["prompt_tokens"] < 12000, big["usage"])
+        chunks, _ = self.b.post([{"role": "user", "content": "tiny"}], "thread-usage3", stream=True)
+        self.assertLess(chunks[-1]["usage"]["prompt_tokens"], 1000)
+
+    def test_usage_claude_mode_reports_the_raw_numbers(self):
+        b = Bridge("--usage", "claude")
+        try:
+            self.assertGreaterEqual(b.post([{"role": "user", "content": "tiny"}], "t")["usage"]["prompt_tokens"], 700000)
+        finally:
+            b.stop()
+
+    def test_autocompact_defaults_to_auto_and_can_be_left_out(self):
+        for extra, expect in ((None, "auto"), (["--autocompact", ""], None)):
+            b = Bridge(*(extra or []), autocompact=False)
+            try:
+                b.chat("hi", "t")
+                (call,) = b.calls()
+                if expect:
+                    self.assertEqual(call[call.index("--autocompact") + 1], expect)
+                else:
+                    self.assertNotIn("--autocompact", call)
+            finally:
+                b.stop()
 
     def test_memory_context_block_is_stripped(self):
         out = self.b.chat("question" + MEMORY, "thread-mem")

@@ -178,7 +178,8 @@ Every option is a flag **or** an environment variable (flag wins).
 | `--add-dir DIR` (repeatable) | `CLAUDE_BRIDGE_ADD_DIRS` (`:`-separated) | `claude --add-dir`: extra directories Claude may read/edit |
 | `--append-system-prompt TEXT` | `CLAUDE_BRIDGE_APPEND_SYSTEM_PROMPT` | text appended to Claude's system prompt |
 | `--append-system-prompt-file FILE` (repeatable) | `CLAUDE_BRIDGE_APPEND_SYSTEM_PROMPT_FILE` (`:`-separated) | files appended to the system prompt, in order. Re-read on every request, so edits apply immediately. An unreadable file makes the request fail (HTTP 502) instead of being silently ignored. |
-| `--autocompact auto\|100k-1M` | `CLAUDE_BRIDGE_AUTOCOMPACT` | `claude --autocompact`: when Claude compacts its own context |
+| `--autocompact auto\|100k-1M` | `CLAUDE_BRIDGE_AUTOCOMPACT` | `claude --autocompact`: when Claude compacts **its own** session context (default `auto`; `""` passes nothing). Hermes' compression cannot shrink Claude's session (the bridge only sends the newest message), so this is what keeps long threads working. |
+| `--usage history\|claude` | `CLAUDE_BRIDGE_USAGE` | what to report as `prompt_tokens`. Default `history`: the size of Hermes' own conversation. `claude`: Claude's raw total, which sums every internal model call and can be hundreds of thousands of tokens for a 3-message chat, making Hermes try to compress it (see Troubleshooting). Raw numbers are always in the response as `claude_usage`. |
 | `--cwd DIR` | `CLAUDE_BRIDGE_CWD` | working directory of `claude` (default `$HERMES_HOME/claude-bridge/workspace`). Claude stores sessions **per directory**, so keep it stable. |
 | `--state-file FILE` | `CLAUDE_BRIDGE_STATE` | Hermes-session → Claude-session bookkeeping (default `$HERMES_HOME/claude-bridge/sessions.json`) |
 | `--timeout SECONDS` | `CLAUDE_BRIDGE_TIMEOUT` | kill a Claude run after this long (default 900) |
@@ -245,6 +246,7 @@ hermes-claude-cli-bridge serve \
 | Reply is slow (15–30 s) for tiny requests | A Hermes background task is going through Claude. Pin the `auxiliary:` tasks (see above). Also consider `--extra-args "--setting-sources user"`. |
 | The model answers `No conversation found` repeatedly | You changed `--cwd`. Claude stores sessions per directory; restore it or delete `sessions.json` to start fresh threads. |
 | `POST /api/show 404`, `/api/tags`, `/props` in the bridge log | Harmless: Hermes probes for other server types (Ollama, llama.cpp) first. The bridge only serves `/health`, `/v1/models` and `/v1/chat/completions`. |
+| Hermes warns `Compression refused: … would have GROWN the conversation` in long threads | Old bridge versions reported Claude's summed token usage, so Hermes thought small chats were huge. Update the bridge (`--usage history` is the default now). Long threads are then compacted by Claude itself (`--autocompact`). |
 | Port already in use | Another bridge is running (`lsof -i :9181`), or choose `--port` and re-run `install` with the same `--port`. |
 | `hermes-claude-cli-bridge: command not found` after `uv tool install` | uv's tool directory is not on `PATH`: run `uv tool update-shell` and open a new terminal (or use the `uvx --from $BRIDGE_SRC ...` form). |
 | `uvx` seems to run old code from a local checkout | uv caches builds of a local path. Use `uvx --refresh --from . hermes-claude-cli-bridge ...` or `uv run hermes-claude-cli-bridge ...` while developing. |

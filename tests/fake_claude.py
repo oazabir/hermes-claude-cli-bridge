@@ -5,7 +5,7 @@ It understands just enough of Claude Code's flags to exercise the bridge:
   --session-id X   new session; fails with "already in use" if X exists
   --resume X       existing session; fails with "No conversation found" if X is unknown
   --no-session-persistence   nothing is stored
-The prompt is the last argument. It answers "reply[<mode>] <prompt>" as stream-json, and if the prompt contains
+The prompt is the last argument. It answers "reply[<mode>] <prompt>" as stream-json (with a huge cumulative cache_read usage, like a real tool loop), and if the prompt contains
 USE_TOOL it also emits a Bash tool call first. Every invocation is appended to $FAKE_CLAUDE_LOG (JSON lines).
 Known sessions live in $FAKE_CLAUDE_STATE (a JSON list).
 """
@@ -64,4 +64,4 @@ text = f"reply[{mode}] {prompt}"
 half = len(text) // 2
 for piece in (text[:half], text[half:]):
     out({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": piece}}})
-out({"type": "result", "is_error": False, "result": text, "usage": {"input_tokens": 3, "output_tokens": 5}})
+out({"type": "result", "is_error": False, "result": text, "usage": {"input_tokens": 3, "cache_read_input_tokens": 700000, "cache_creation_input_tokens": 0, "output_tokens": 5}})
