@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Use the Claude Code CLI as a Hermes Agent model provider, with one resumable Claude Code session per Hermes thread."
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Omar AL Zabir" }]
 dependencies = []          # standard library only
 keywords = ["hermes", "hermes-agent", "claude", "claude-code", "llm", "bridge", "openai-compatible"]
 classifiers = [
@@ -31,7 +34,7 @@ build-backend = "hatchling.build"
 packages = ["src/hermes_claude_cli_bridge"]   # includes plugin/claude-code-bridge/ as package data
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "README.md", "pyproject.toml", "uv.lock"]
+include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml", "uv.lock"]
 
 [dependency-groups]
 dev = []                   # tests use only the standard library: uv run python -m unittest discover -s tests -v

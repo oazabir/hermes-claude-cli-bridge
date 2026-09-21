@@ -286,3 +286,7 @@ tests/e2e_bridge.py                                         tests against the re
 ## API surface (for the curious)
 
 `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming SSE and non-streaming). The Hermes session id arrives as `claude_bridge.session_id` in the request body; optional per-request `claude_bridge.add_dirs`, `append_system_prompt`, `autocompact`, `effort`, `cwd` are honoured too.
+
+## License
+
+[MIT](LICENSE) © Omar AL Zabir
