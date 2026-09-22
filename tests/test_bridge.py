@@ -376,6 +376,31 @@ class HardeningTests(unittest.TestCase):
         finally:
             b.stop()
 
+    def test_disconnect_during_a_silent_turn_frees_the_thread_quickly(self):
+        """Hermes' busy_input_mode=interrupt aborts the HTTP request. If the turn happens to be silent
+        (one long tool call), nothing is written, so without an explicit poll the bridge only notices
+        at the next write — the abandoned claude keeps running and keeps holding the session lock, and
+        the follow-up message then waits out --queue-timeout and 429s."""
+        b = Bridge("--client-check-interval", "1", "--queue-timeout", "25", FAKE_CLAUDE_SLEEP="30")
+        try:
+            import http.client
+            conn = http.client.HTTPConnection("127.0.0.1", b.port, timeout=10)
+            body = json.dumps({"model": "sonnet", "stream": True, "messages": [{"role": "user", "content": "hi"}],
+                               "claude_bridge": {"session_id": "abandoned"}})
+            conn.request("POST", "/v1/chat/completions", body, {"content-type": "application/json"})
+            time.sleep(2)
+            conn.close()  # the caller hangs up while claude is still silent
+
+            started = time.time()
+            out = b.chat("second message NOSLEEP", "abandoned", timeout=40)
+            waited = time.time() - started
+            self.assertIn("reply[", out)
+            # before the fix the dead turn held the lock for its full 30s, so this waited out
+            # --queue-timeout (25s) and came back 429
+            self.assertLess(waited, 15, f"follow-up waited {waited:.1f}s — the lock was not released promptly")
+        finally:
+            b.stop()
+
     def test_mid_thread_transcript_is_capped(self):
         b = Bridge("--max-transcript-chars", "2000")
         try:

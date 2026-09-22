@@ -29,7 +29,9 @@ if log:
 if os.environ.get("FAKE_CLAUDE_SPAWN_CHILD") == "1":
     # a grandchild that inherits stdout and outlives us, exactly like a `claude` Bash tool call
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
-if os.environ.get("FAKE_CLAUDE_SLEEP"):
+if os.environ.get("FAKE_CLAUDE_SLEEP") and "NOSLEEP" not in prompt:
+    # NOSLEEP lets one call in a sleepy run answer immediately, so a test can time how long a
+    # FOLLOW-UP waited for the session lock without also waiting out its own sleep.
     import time
     time.sleep(float(os.environ["FAKE_CLAUDE_SLEEP"]))
 

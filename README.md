@@ -186,6 +186,7 @@ Every option is a flag **or** an environment variable (flag wins).
 | `--session-ttl-days N` | `CLAUDE_BRIDGE_SESSION_TTL_DAYS` | housekeeping: forget a thread after N days with no message, and delete Claude Code's own transcript for it (default `7`; `0` keeps everything forever). See below. |
 | `--max-concurrency N` | `CLAUDE_BRIDGE_MAX_CONCURRENCY` | most `claude` processes at once; further turns queue (default 8) |
 | `--queue-timeout SECONDS` | `CLAUDE_BRIDGE_QUEUE_TIMEOUT` | how long a turn waits for a free slot, or for the previous turn **of the same thread**, before returning HTTP 429 (default 120) |
+| `--client-check-interval SECONDS` | `CLAUDE_BRIDGE_CLIENT_CHECK_INTERVAL` | how often to check that the caller is still connected (default 5; `0` disables). Without it a disconnect is only noticed at the next write, so a turn that is silent for minutes during one long tool call keeps running — and keeps its thread's lock — after the caller has given up. |
 | `--max-body-mb N` | `CLAUDE_BRIDGE_MAX_BODY_MB` | reject request bodies larger than this (default 32) |
 | `--max-transcript-chars N` | `CLAUDE_BRIDGE_MAX_TRANSCRIPT_CHARS` | cap on the one-time history replay when a thread reaches the bridge mid-conversation (default 200000; `0` = no cap). Older turns are dropped first. |
 | `--auth-token TOKEN` | `CLAUDE_BRIDGE_AUTH_TOKEN` | require `Authorization: Bearer TOKEN`. Off by default; see Security. |
@@ -224,6 +225,8 @@ hermes-claude-cli-bridge serve \
 - File attachments arrive as a path in the message; Claude opens the file itself.
 
 **Housekeeping (`--session-ttl-days`, default 7).** Claude Code never expires a session by itself, so without this every thread the bridge ever handled would stay on disk forever. At start-up and every six hours the bridge drops threads with no message for N days, and for each one deletes Claude's own transcript (`~/.claude/projects/*/<uuid>.jsonl`, its sibling directory, and any `~/.claude/todos/<uuid>*`). Only sessions the bridge itself tracked are touched, never a session you started yourself in that directory. A dropped thread is not an error: if the same Hermes thread speaks again it simply starts a fresh Claude session. Set `--session-ttl-days 0` to keep everything.
+
+**A caller that hangs up.** Hermes aborts the request when a new message arrives and `busy_input_mode` is `interrupt`. The bridge polls the connection every `--client-check-interval` seconds, kills Claude and its whole process group, and releases the thread's lock at once, so the follow-up turn starts immediately instead of queueing behind an abandoned one. Nothing is injected into a running Claude: its prompt is fixed when the process starts, so a follow-up is always a new turn that `--resume`s the same session. Work Claude already did (edits, commits, commands) survives; only the unfinished turn is dropped.
 
 **Back-pressure.** One turn at a time per thread, and at most `--max-concurrency` Claude processes in total. A turn that cannot get a slot within `--queue-timeout` returns HTTP 429 rather than blocking for the full `--timeout`.
 

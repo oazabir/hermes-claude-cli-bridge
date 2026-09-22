@@ -26,8 +26,10 @@ import argparse
 import json
 import os
 import re
+import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -49,6 +51,10 @@ _slots = threading.BoundedSemaphore(8)  # resized by main(): concurrent claude p
 
 class Busy(RuntimeError):
     """Too many turns in flight, or this thread is already running one -> HTTP 429."""
+
+
+class ClientGone(RuntimeError):
+    """The caller hung up mid-turn; claude was killed and nothing is left to reply to."""
 
 
 # --------------------------------------------------------------------------- state
@@ -307,18 +313,31 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None):
+def client_is_gone(conn) -> bool:
+    """True once the caller has closed its end. A half-closed socket reads as readable-with-no-bytes;
+    real pipelined data is left untouched by MSG_PEEK."""
+    try:
+        if not select.select([conn], [], [], 0)[0]:
+            return False
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except (OSError, ValueError):
+        return True  # socket already torn down
+
+
+def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None):
     """Run one claude turn. Returns (result_event, stderr_text). Streams via on_text; on_tool(headline, is_subagent).
     Waits for a concurrency slot first, so a burst of Hermes threads cannot fork unbounded claude processes."""
     if not _slots.acquire(timeout=getattr(CFG, "queue_timeout", 120)):
         raise Busy(f"bridge is at capacity ({CFG.max_concurrency} concurrent turns); try again shortly")
     try:
-        return _run_claude(cmd, prompt, cwd, on_text, on_reasoning, on_tool)
+        return _run_claude(cmd, prompt, cwd, on_text, on_reasoning, on_tool, client_gone)
     finally:
         _slots.release()
 
 
-def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None):
+def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None):
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
@@ -339,6 +358,27 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     reader.start()
     timer = threading.Timer(CFG.timeout, _kill_tree, args=(proc,))
     timer.start()
+    # A dead client is otherwise only noticed when we next write to it, and a turn can be silent for
+    # minutes during one long tool call. Hermes' busy_input_mode=interrupt aborts the request exactly
+    # like that, so without this poll the abandoned claude keeps running and keeps the session lock.
+    interval = getattr(CFG, "client_check_interval", 5.0)
+    stop_watch = threading.Event()
+    abandoned: list[bool] = []
+
+    def _watch_client():
+        while not stop_watch.wait(interval):
+            try:
+                if client_gone():
+                    abandoned.append(True)
+                    _kill_tree(proc)
+                    return
+            except Exception:
+                return
+
+    watcher = None
+    if client_gone is not None and interval and interval > 0:
+        watcher = threading.Thread(target=_watch_client, daemon=True)
+        watcher.start()
     result = None
     seen_tools: set[str] = set()
     try:
@@ -366,9 +406,14 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
         raise
     finally:
         timer.cancel()
+        stop_watch.set()
+        if watcher is not None:
+            watcher.join(2)
         # the error text drives the resume/session-id self-heal below, so wait for it rather
         # than racing the reader thread and treating a lost message as "no error"
         reader.join(5)
+    if abandoned:
+        raise ClientGone("caller disconnected; claude was stopped")
     return result, "".join(stderr_buf)
 
 
@@ -393,7 +438,7 @@ def _read_prompt_file(path: str) -> str:
     return text
 
 
-def turn(body: dict, on_text, on_reasoning=None, on_tool=None):
+def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None):
     """Run a chat turn with session bookkeeping. Returns (result, session_uuid)."""
     messages = body.get("messages") or []
     ext = body.get("claude_bridge") or {}
@@ -420,7 +465,7 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None):
     if not hsid:  # no thread identity -> one-shot, nothing persisted
         sid = str(uuid.uuid4())
         res, err = run_claude(build_cmd(model=model, session=sid, resume=False, opts=opts, persist=False),
-                              transcript(messages), cwd, on_text, on_reasoning, on_tool)
+                              transcript(messages), cwd, on_text, on_reasoning, on_tool, client_gone)
         return _check(res, err), None
 
     sid = session_uuid(hsid)
@@ -440,7 +485,7 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None):
             res, err = run_claude(
                 build_cmd(model=model, session=sid, resume=resume, opts=opts, persist=True),
                 prompt, state.get(sid, {}).get("cwd", cwd),
-                lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool)
+                lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool, client_gone)
             failed = res is None or res.get("is_error")
             blob = (err + json.dumps(res or {})).lower()
             if failed and not streamed and attempt == 0:
@@ -514,6 +559,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _client_gone(self) -> bool:
+        return client_is_gone(self.connection)
+
     def _refuse(self) -> bool:
         """Reject anything that is not a server-side JSON API call. The bridge runs claude with
         --dangerously-skip-permissions, and a web page the user visits can POST to 127.0.0.1: a
@@ -568,7 +616,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream(body, cid, created, model, len(raw))
         parts: list[str] = []
         try:
-            res, sid = turn(body, parts.append)
+            res, sid = turn(body, parts.append, client_gone=self._client_gone)
+        except ClientGone:
+            return  # nobody left to answer
         except Busy as e:
             return self._json(429, {"error": {"message": str(e), "type": "claude_bridge_busy"}})
         except Exception as e:
@@ -614,11 +664,11 @@ class Handler(BaseHTTPRequestHandler):
                     line_start[0] = True
 
             res, sid = turn(body, on_text, lambda t: self._sse(chunk({"reasoning_content": t})),
-                            on_tool if CFG.tool_events != "off" else None)
+                            on_tool if CFG.tool_events != "off" else None, client_gone=self._client_gone)
             if not sent and res.get("result"):
                 self._sse(chunk({"content": res["result"]}))
             self._sse(chunk({}, "stop", usage=_usage(res, body, raw_len), claude_usage=res.get("usage")))
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ClientGone):
             return
         except Busy as e:
             try:
@@ -676,6 +726,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--queue-timeout", type=float, default=float(env("CLAUDE_BRIDGE_QUEUE_TIMEOUT", "120")),
                     help="how long a turn waits for a free slot, or for the previous turn of the same thread, "
                          "before returning HTTP 429 (default 120s)")
+    ap.add_argument("--client-check-interval", type=float, default=float(env("CLAUDE_BRIDGE_CLIENT_CHECK_INTERVAL", "5")),
+                    help="how often (seconds) to check whether the caller is still connected, so an abandoned turn "
+                         "is stopped during a long silent tool call instead of at the next write (default 5; 0 disables)")
     ap.add_argument("--max-body-mb", type=float, default=float(env("CLAUDE_BRIDGE_MAX_BODY_MB", "32")),
                     help="reject request bodies larger than this (default 32)")
     ap.add_argument("--max-transcript-chars", type=int, default=int(env("CLAUDE_BRIDGE_MAX_TRANSCRIPT_CHARS", "200000")),
@@ -706,7 +759,8 @@ def main(argv=None):
     print(f"[bridge] listening on http://{CFG.host}:{CFG.port}/v1  (claude={CFG.claude_bin} add_dirs={CFG.add_dir} "
           f"effort={CFG.effort or 'default'} autocompact={CFG.autocompact or 'default'} "
           f"prompt_files={CFG.append_system_prompt_file or '-'} ttl_days={CFG.session_ttl_days or 'off'} "
-          f"max_concurrency={CFG.max_concurrency} auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
+          f"max_concurrency={CFG.max_concurrency} client_check={CFG.client_check_interval or 'off'}s "
+          f"auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
