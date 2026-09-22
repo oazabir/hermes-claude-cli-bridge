@@ -162,7 +162,7 @@ class BridgeTests(unittest.TestCase):
     def test_streaming_shows_tool_headline_on_its_own_line(self):
         chunks, raw = self.b.post([{"role": "user", "content": "USE_TOOL please"}], "thread-tool", stream=True)
         text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
-        self.assertIn("\n🔧 Bash: list the files\n", "\n" + text)
+        self.assertIn("\n🔧 Bash: `list the files`\n", "\n" + text)
         self.assertIn("reply[new] USE_TOOL please", text)
         self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
 
@@ -422,13 +422,30 @@ class HardeningTests(unittest.TestCase):
 class HelperTests(unittest.TestCase):
     def test_tool_headline(self):
         h = bridge.tool_headline
-        self.assertEqual(h("Bash", {"command": "ls   -la\n/tmp"}), "Bash: ls -la")
-        self.assertEqual(h("Bash", {"command": "# Count files\nfind . | wc -l"}), "Bash: Count files")
-        self.assertEqual(h("Bash", {"description": "Do the thing", "command": "x"}), "Bash: Do the thing")
-        self.assertEqual(h("Read", {"file_path": str(Path.home()) + "/x.md"}), "Read: ~/x.md")
-        self.assertEqual(h("mcp__plugin_acme_notes__add_note", {"title": "t"}), "add_note (notes): t")
-        self.assertLessEqual(len(h("Bash", {"command": "x" * 500})), 108)
+        self.assertEqual(h("Bash", {"command": "ls   -la\n/tmp"}), "Bash: `ls -la`")
+        self.assertEqual(h("Bash", {"command": "# Count files\nfind . | wc -l"}), "Bash: `Count files`")
+        self.assertEqual(h("Bash", {"description": "Do the thing", "command": "x"}), "Bash: `Do the thing`")
+        self.assertEqual(h("Read", {"file_path": str(Path.home()) + "/x.md"}), "Read: `~/x.md`")
+        self.assertEqual(h("mcp__plugin_acme_notes__add_note", {"title": "t"}), "add_note (notes): `t`")
+        self.assertLessEqual(len(h("Bash", {"command": "x" * 500})), 110)
         self.assertEqual(h("Whatever", None), "Whatever")
+
+    def test_headline_paths_cannot_be_auto_attached_by_the_chat_gateway(self):
+        """Hermes uploads any bare ~/ or / path in a reply that exists on disk; inline code is skipped.
+        Every path a headline shows must therefore sit inside one self-contained backtick pair."""
+        h = bridge.tool_headline
+        # a backtick in the tool input must not be able to close the span early
+        line = h("Bash", {"command": "cat `ls ~/notes/INFRA.md`"})
+        self.assertEqual(line.count("`"), 2, line)
+        self.assertTrue(line.endswith("`"))
+        for name, inp in (("Read", {"file_path": str(Path.home()) + "/infra/INFRA.md"}),
+                          ("Edit", {"file_path": "/etc/hosts.md"}),
+                          ("Grep", {"pattern": "~/infra/LOG.md"})):
+            line = h(name, inp)
+            self.assertEqual(line.count("`"), 2, line)
+            body = line.split("`")[1]
+            self.assertNotIn("`", body)
+            self.assertNotIn("\n", line)
 
     def test_session_uuid_is_stable_and_real_uuids_pass_through(self):
         a = bridge.session_uuid("20260101_abc")

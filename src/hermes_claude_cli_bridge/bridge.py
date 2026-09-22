@@ -295,7 +295,15 @@ def tool_headline(name: str, inp: dict) -> str:
     detail = " ".join(detail.replace(str(Path.home()), "~").split())
     if len(detail) > 100:
         detail = detail[:99] + "…"
-    return f"{shown}: {detail}" if detail else shown
+    # Wrap the detail in inline code. A headline like `Read: ~/infra/INFRA.md` otherwise hands the
+    # chat gateway a bare `~/`-anchored path, and Hermes auto-uploads any such path that exists on
+    # disk as a native attachment (gateway/platforms/base.py extract_local_files) -- whole repo
+    # files landing in the channel. Paths inside inline code are skipped by that extractor.
+    # Backticks inside the detail would end the span early, so they become quotes; the span cannot
+    # cross a newline (the matcher is `[^`\n]+`) and headlines always start their own line, so the
+    # pair here is self-contained.
+    detail = detail.replace("`", "'")
+    return f"{shown}: `{detail}`" if detail else shown
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
