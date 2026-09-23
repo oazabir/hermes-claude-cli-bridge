@@ -190,7 +190,7 @@ Every option is a flag **or** an environment variable (flag wins).
 | `--max-body-mb N` | `CLAUDE_BRIDGE_MAX_BODY_MB` | reject request bodies larger than this (default 32) |
 | `--max-transcript-chars N` | `CLAUDE_BRIDGE_MAX_TRANSCRIPT_CHARS` | cap on the one-time history replay when a thread reaches the bridge mid-conversation (default 200000; `0` = no cap). Older turns are dropped first. |
 | `--auth-token TOKEN` | `CLAUDE_BRIDGE_AUTH_TOKEN` | require `Authorization: Bearer TOKEN`. Off by default; see Security. |
-| `--tool-events content\|reasoning\|off` | `CLAUDE_BRIDGE_TOOL_EVENTS` | how Claude's tool calls are shown: as `🔧 …` lines in the reply (default), as reasoning text (only visible if Hermes shows reasoning), or not at all. Streaming only. |
+| `--tool-events content\|reasoning\|off` | `CLAUDE_BRIDGE_TOOL_EVENTS` | how Claude's tool calls are shown: as `🔧 …` lines in the reply (default), as reasoning text (only visible if Hermes shows reasoning), or not at all. Streaming only. With the Hermes plugin installed, text, tool lines and the final answer are posted as separate chat messages, as with Hermes' own tools (plugin and bridge must both be this version or newer). |
 | `--no-session-context` | `CLAUDE_BRIDGE_SESSION_CONTEXT=0` | do not tell Claude the platform/channel/user (see below) |
 | `--keep-memory-context` | `CLAUDE_BRIDGE_KEEP_MEMORY_CONTEXT=1` | keep the `<memory-context>` block Hermes appends to messages (see below) |
 | `--forward-system` | `CLAUDE_BRIDGE_FORWARD_SYSTEM=1` | also append Hermes' whole system prompt. Off by default: it is very long and describes Hermes-only tools Claude does not have. |

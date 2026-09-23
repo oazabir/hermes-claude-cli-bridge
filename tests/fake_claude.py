@@ -7,7 +7,8 @@ It understands just enough of Claude Code's flags to exercise the bridge:
   --no-session-persistence   nothing is stored
 The prompt is read from stdin, like the real CLI when no prompt argument is given. It answers
 "reply[<mode>] <prompt>" as stream-json (with a huge cumulative cache_read usage, like a real tool loop), and if the prompt contains
-USE_TOOL it also emits a Bash tool call first. Every invocation is appended to $FAKE_CLAUDE_LOG (JSON lines).
+USE_TOOL it also emits a Bash tool call first
+(after a 'Checking.' text block if it contains PREAMBLE). Every invocation is appended to $FAKE_CLAUDE_LOG (JSON lines).
 Known sessions live in $FAKE_CLAUDE_STATE (a JSON list).
 Set FAKE_CLAUDE_SLEEP to make a run hang, and FAKE_CLAUDE_SPAWN_CHILD=1 to leave a grandchild holding stdout
 (the case that used to wedge the bridge's read loop past its timeout).
@@ -69,6 +70,8 @@ elif "--resume" in argv:
 if state_path and mode != "oneshot":
     json.dump(sorted(known), open(state_path, "w"))
 
+if "PREAMBLE" in prompt:
+    out({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "Checking."}}})
 if "USE_TOOL" in prompt:
     out({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "# list the files\nls -la"}}]}})

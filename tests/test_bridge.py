@@ -221,6 +221,25 @@ class BridgeTests(unittest.TestCase):
         finally:
             b.stop()
 
+    def test_segment_breaks_only_when_asked(self):
+        def contents(**ext):
+            payload = {"model": "sonnet", "stream": True, "claude_bridge": {"session_id": "thread-seg", **ext},
+                       "messages": [{"role": "user", "content": "PREAMBLE USE_TOOL"}]}
+            raw = self.b.raw_post(json.dumps(payload).encode(), {"content-type": "application/json"}, 30).read().decode()
+            return [json.loads(l[6:])["choices"][0]["delta"].get("content") for l in raw.splitlines()
+                    if l.startswith("data: ") and l != "data: [DONE]"]
+        plain = "".join(c or "" for c in contents())
+        self.assertNotIn(bridge.SEGMENT_BREAK, plain, "clients that did not ask never see the marker")
+        text = "".join(c or "" for c in contents(segments=True))
+        preamble, tools, answer = text.split(bridge.SEGMENT_BREAK)
+        self.assertEqual(preamble, "Checking.")
+        self.assertEqual(tools, "🔧 Bash: `list the files`\n", "the tool line starts its own message, no stray newline")
+        self.assertIn("reply[", answer)
+        self.assertNotIn("🔧", answer, "the answer is a message of its own")
+
+    def test_segment_marker_never_reaches_claude(self):
+        self.assertEqual(bridge._text("a" + bridge.SEGMENT_BREAK + "b"), "ab")
+
     def test_tool_events_off(self):
         b = Bridge("--tool-events", "off")
         try:
@@ -229,6 +248,49 @@ class BridgeTests(unittest.TestCase):
             self.assertNotIn("🔧", text)
         finally:
             b.stop()
+
+
+class PluginSegmentTests(unittest.TestCase):
+    """The Hermes plugin turns the bridge's marker into Hermes' own new-message signal (stream callback None)."""
+
+    def test_marker_becomes_a_segment_break(self):
+        import importlib.util
+        import types
+        seen = []
+
+        class AIAgent:
+            def __init__(self):
+                self.stream_delta_callback = seen.append
+
+            def _fire_stream_delta(self, text):
+                if text:
+                    self.stream_delta_callback(text)
+
+        providers, base = types.ModuleType("providers"), types.ModuleType("providers.base")
+        providers.register_provider = lambda p: None
+        base.ProviderProfile = type("ProviderProfile", (), {"__init__": lambda self, **kw: None})
+        stubs = {"providers": providers, "providers.base": base, "run_agent": types.SimpleNamespace(AIAgent=AIAgent)}
+        saved = {k: sys.modules.get(k) for k in stubs}
+        sys.modules.update(stubs)
+        try:
+            path = SRC / "hermes_claude_cli_bridge" / "plugin" / "claude-code-bridge" / "__init__.py"
+            spec = importlib.util.spec_from_file_location("claude_bridge_plugin_under_test", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.assertEqual(mod.SEGMENT_BREAK, bridge.SEGMENT_BREAK)
+            self.assertEqual(mod.claude_code.build_extra_body(session_id="s")["claude_bridge"],
+                             {"segments": True, "session_id": "s"})
+            mod._install_segment_breaks()  # idempotent: must not wrap twice
+            agent = AIAgent()
+            for t in ("Checking.", mod.SEGMENT_BREAK, "🔧 Bash\n", mod.SEGMENT_BREAK, "answer"):
+                agent._fire_stream_delta(t)
+            self.assertEqual(seen, ["Checking.", None, "🔧 Bash\n", None, "answer"])
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
 
 
 class HardeningTests(unittest.TestCase):

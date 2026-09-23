@@ -42,6 +42,10 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 NAMESPACE = uuid.UUID("6f1d3a52-8c1e-4c5e-9a53-4d1f6f0c7b11")
 MODELS = ["sonnet", "opus", "haiku"]
+# Streamed on its own when the client asked for segments (the Hermes plugin does): "start a new chat message
+# here". The plugin turns it into Hermes' own segment break, so tool headlines and the answer land in separate
+# posts. U+2063 INVISIBLE SEPARATOR: never visible if some other path lets it through.
+SEGMENT_BREAK = "\u2063"
 
 CFG = argparse.Namespace()  # replaced by main(); getattr(..., default) until then
 _state_lock = threading.RLock()
@@ -175,10 +179,11 @@ def strip_memory_context(text: str) -> str:
 
 def _text(content) -> str:
     if isinstance(content, str):
-        return strip_memory_context(content)
+        return strip_memory_context(content).replace(SEGMENT_BREAK, "")
     if isinstance(content, list):
         return "\n".join(
-            strip_memory_context(p.get("text", "")) for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text")
+            strip_memory_context(p.get("text", "")).replace(SEGMENT_BREAK, "")
+            for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text")
         )
     return ""
 
@@ -658,13 +663,24 @@ class Handler(BaseHTTPRequestHandler):
             self._sse(chunk({"role": "assistant", "content": ""}))
             sent = []
             line_start = [True]  # keep tool headlines on their own line
+            # text -> tools -> text: each run becomes its own chat message, like Hermes' own tool loop
+            segments = bool((body.get("claude_bridge") or {}).get("segments"))
+            last = [None]  # "text" | "tool": kind of the previous event
+
+            def switch_to(kind):
+                if segments and last[0] not in (None, kind):
+                    self._sse(chunk({"content": SEGMENT_BREAK}))
+                    line_start[0] = True
+                last[0] = kind
 
             def on_text(t):
+                switch_to("text")
                 sent.append(t)
                 line_start[0] = t.endswith("\n")
                 self._sse(chunk({"content": t}))
 
             def on_tool(headline, sub):
+                switch_to("tool")
                 if CFG.tool_events == "reasoning":
                     self._sse(chunk({"reasoning_content": f"🔧 {headline}\n"}))
                 elif CFG.tool_events == "content":
@@ -672,7 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                     line_start[0] = True
 
             res, sid = turn(body, on_text, lambda t: self._sse(chunk({"reasoning_content": t})),
-                            on_tool if CFG.tool_events != "off" else None, client_gone=self._client_gone)
+                            on_tool if CFG.tool_events != "off" or segments else None, client_gone=self._client_gone)
             if not sent and res.get("result"):
                 self._sse(chunk({"content": res["result"]}))
             self._sse(chunk({}, "stop", usage=_usage(res, body, raw_len), claude_usage=res.get("usage")))

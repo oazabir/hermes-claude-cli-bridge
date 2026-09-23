@@ -21,9 +21,43 @@ from providers import register_provider
 from providers.base import ProviderProfile
 
 
+# The bridge streams a whole Claude Code turn (text, tool calls, more text) as ONE completion, so Hermes would
+# post it all as one chat message. Hermes starts a new message when its stream callback gets None (what its own
+# tool loop does between API calls); the bridge marks those points with SEGMENT_BREAK, and this patch converts
+# them. Only the chat display callback gets the None: TTS reads None as end-of-stream.
+SEGMENT_BREAK = "\u2063"
+
+
+def _install_segment_breaks() -> bool:
+    try:
+        from run_agent import AIAgent
+    except Exception:
+        return False
+    fire = AIAgent._fire_stream_delta
+    if getattr(fire, "_claude_bridge_segments", False):
+        return True
+
+    def _fire_stream_delta(self, text):
+        if not isinstance(text, str) or SEGMENT_BREAK not in text:
+            return fire(self, text)
+        for i, piece in enumerate(text.split(SEGMENT_BREAK)):
+            if i and self.stream_delta_callback:
+                try:
+                    self.stream_delta_callback(None)
+                except Exception:
+                    pass
+            if piece:
+                fire(self, piece)
+
+    _fire_stream_delta._claude_bridge_segments = True
+    AIAgent._fire_stream_delta = _fire_stream_delta
+    return True
+
+
 class ClaudeCodeProfile(ProviderProfile):
     def build_extra_body(self, *, session_id=None, **context):
-        ext: dict = {}
+        # installed here, not at import: run_agent may still be mid-import when plugins are discovered
+        ext: dict = {"segments": True} if _install_segment_breaks() else {}
         if session_id:
             ext["session_id"] = session_id
         dirs = [d for d in os.getenv("CLAUDE_CODE_ADD_DIRS", "").split(os.pathsep) if d]
