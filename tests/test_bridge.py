@@ -221,24 +221,37 @@ class BridgeTests(unittest.TestCase):
         finally:
             b.stop()
 
-    def test_segment_breaks_only_when_asked(self):
-        def contents(**ext):
-            payload = {"model": "sonnet", "stream": True, "claude_bridge": {"session_id": "thread-seg", **ext},
-                       "messages": [{"role": "user", "content": "PREAMBLE USE_TOOL"}]}
-            raw = self.b.raw_post(json.dumps(payload).encode(), {"content-type": "application/json"}, 30).read().decode()
-            return [json.loads(l[6:])["choices"][0]["delta"].get("content") for l in raw.splitlines()
-                    if l.startswith("data: ") and l != "data: [DONE]"]
-        plain = "".join(c or "" for c in contents())
-        self.assertNotIn(bridge.SEGMENT_BREAK, plain, "clients that did not ask never see the marker")
-        text = "".join(c or "" for c in contents(segments=True))
-        preamble, tools, answer = text.split(bridge.SEGMENT_BREAK)
-        self.assertEqual(preamble, "Checking.")
-        self.assertEqual(tools, "🔧 Bash: `list the files`\n", "the tool line starts its own message, no stray newline")
+    def test_segment_markers_only_when_asked(self):
+        plain = "".join(c or "" for c in self._contents(self.b))
+        self.assertIsNone(bridge.MARKERS.search(plain), "clients that did not ask never see a marker")
+        text = "".join(c or "" for c in self._contents(self.b, segments=True))
+        self.assertEqual(text.split(bridge.TOOL_RUN)[0], bridge.TEXT_RUN + "Checking.")
+        tools, answer = text.split(bridge.TOOL_RUN)[1].split(bridge.TEXT_RUN)
+        self.assertEqual(tools, "🔧 Bash: `list the files`\n", "the tool line starts its own run, no stray newline")
         self.assertIn("reply[", answer)
-        self.assertNotIn("🔧", answer, "the answer is a message of its own")
+        self.assertNotIn(bridge.FLUSH_TICK, text, "a quick turn needs no flush")
 
-    def test_segment_marker_never_reaches_claude(self):
-        self.assertEqual(bridge._text("a" + bridge.SEGMENT_BREAK + "b"), "ab")
+    def test_flush_tick_during_a_slow_tool(self):
+        b = Bridge("--flush-interval", "0.3", FAKE_CLAUDE_TOOL_SECONDS="1.2")
+        try:
+            text = "".join(c or "" for c in self._contents(b, segments=True))
+            before, _, after = text.partition(bridge.FLUSH_TICK)
+            self.assertIn("🔧", before, "the tick comes while the tool runs, after its headline")
+            self.assertIn("reply[", after)
+            self.assertEqual(text.count(bridge.FLUSH_TICK), 1, "no tick without new output")
+        finally:
+            b.stop()
+
+    @staticmethod
+    def _contents(b, **ext):
+        payload = {"model": "sonnet", "stream": True, "claude_bridge": {"session_id": "thread-seg", **ext},
+                   "messages": [{"role": "user", "content": "PREAMBLE USE_TOOL"}]}
+        raw = b.raw_post(json.dumps(payload).encode(), {"content-type": "application/json"}, 30).read().decode()
+        return [json.loads(l[6:])["choices"][0]["delta"].get("content") for l in raw.splitlines()
+                if l.startswith("data: ") and l != "data: [DONE]"]
+
+    def test_segment_markers_never_reach_claude(self):
+        self.assertEqual(bridge._text("a" + bridge.TEXT_RUN + bridge.TOOL_RUN + bridge.FLUSH_TICK + "b"), "ab")
 
     def test_tool_events_off(self):
         b = Bridge("--tool-events", "off")
@@ -251,20 +264,30 @@ class BridgeTests(unittest.TestCase):
 
 
 class PluginSegmentTests(unittest.TestCase):
-    """The Hermes plugin turns the bridge's marker into Hermes' own new-message signal (stream callback None)."""
+    """The Hermes plugin maps the bridge's markers onto Hermes' own new-message / interim-message machinery."""
 
-    def test_marker_becomes_a_segment_break(self):
+    T, O, F = bridge.TEXT_RUN, bridge.TOOL_RUN, bridge.FLUSH_TICK
+
+    def setUp(self):
         import importlib.util
         import types
-        seen = []
+        test = self
 
         class AIAgent:
-            def __init__(self):
-                self.stream_delta_callback = seen.append
+            def __init__(self, live):
+                self.shown, self.interim = [], []
+                self.stream_delta_callback = self.shown.append if live else None
+                self.interim_assistant_callback = lambda text, already_streamed=False: self.interim.append(text)
 
             def _fire_stream_delta(self, text):
-                if text:
+                if text and self.stream_delta_callback:
                     self.stream_delta_callback(text)
+
+            def _interruptible_streaming_api_call(self, api_kwargs, on_first_delta=None):
+                for d in test.deltas:
+                    self._fire_stream_delta(d)
+                msg = types.SimpleNamespace(content="".join(test.deltas))
+                return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
         providers, base = types.ModuleType("providers"), types.ModuleType("providers.base")
         providers.register_provider = lambda p: None
@@ -272,25 +295,46 @@ class PluginSegmentTests(unittest.TestCase):
         stubs = {"providers": providers, "providers.base": base, "run_agent": types.SimpleNamespace(AIAgent=AIAgent)}
         saved = {k: sys.modules.get(k) for k in stubs}
         sys.modules.update(stubs)
-        try:
-            path = SRC / "hermes_claude_cli_bridge" / "plugin" / "claude-code-bridge" / "__init__.py"
-            spec = importlib.util.spec_from_file_location("claude_bridge_plugin_under_test", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            self.assertEqual(mod.SEGMENT_BREAK, bridge.SEGMENT_BREAK)
-            self.assertEqual(mod.claude_code.build_extra_body(session_id="s")["claude_bridge"],
-                             {"segments": True, "session_id": "s"})
-            mod._install_segment_breaks()  # idempotent: must not wrap twice
-            agent = AIAgent()
-            for t in ("Checking.", mod.SEGMENT_BREAK, "🔧 Bash\n", mod.SEGMENT_BREAK, "answer"):
-                agent._fire_stream_delta(t)
-            self.assertEqual(seen, ["Checking.", None, "🔧 Bash\n", None, "answer"])
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = v
+        self.addCleanup(lambda: [sys.modules.pop(k, None) if v is None else sys.modules.__setitem__(k, v)
+                                 for k, v in saved.items()])
+        path = SRC / "hermes_claude_cli_bridge" / "plugin" / "claude-code-bridge" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("claude_bridge_plugin_under_test", path)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+        self.AIAgent = AIAgent
+        self.assertEqual((self.mod.TEXT_RUN, self.mod.TOOL_RUN, self.mod.FLUSH_TICK), (self.T, self.O, self.F))
+        self.assertEqual(self.mod.claude_code.build_extra_body(session_id="s")["claude_bridge"],
+                         {"segments": True, "session_id": "s"})
+        self.mod._install_segment_breaks()  # idempotent: must not wrap twice
+
+    def run_turn(self, live, deltas):
+        self.deltas = deltas
+        agent = self.AIAgent(live)
+        return agent, agent._interruptible_streaming_api_call({}).choices[0].message.content
+
+    def test_streaming_display_gets_a_new_message_per_run(self):
+        agent, content = self.run_turn(True, [self.T, "Checking.", self.O, "🔧 Bash\n", self.F, self.T, "answer"])
+        self.assertEqual(agent.shown, ["Checking.", None, "🔧 Bash\n", None, "answer"])
+        self.assertEqual(agent.interim, [], "a streaming display already shows everything live")
+        self.assertEqual(content, "Checking.🔧 Bash\nanswer", "markers never reach Hermes' history")
+
+    def test_without_streaming_ticks_post_progress_and_the_answer_stands_alone(self):
+        agent, content = self.run_turn(False, [
+            self.T, "Checking.", self.O, "🔧 Bash: a\n", self.F,   # tick 1: preamble + tool so far
+            "🔧 Bash: b\n", self.T, "Found it", self.F,              # tick 2: text may be the answer, wait
+            self.O, "🔧 Read: c\n", self.T, "The answer."])        # end: rest of progress, then the answer
+        self.assertEqual(agent.shown, [])
+        self.assertEqual(agent.interim, ["Checking.\n🔧 Bash: a", "🔧 Bash: b", "Found it\n🔧 Read: c"])
+        self.assertEqual(content, "The answer.", "the reply is only the answer, posted on its own")
+
+    def test_without_streaming_a_turn_ending_in_tools_keeps_its_reply(self):
+        agent, content = self.run_turn(False, [self.T, "Done.", self.O, "🔧 Bash\n"])
+        self.assertEqual(agent.interim, [])
+        self.assertEqual(content, "Done.🔧 Bash\n", "never trim the reply to nothing")
+
+    def test_other_providers_are_untouched(self):
+        agent, content = self.run_turn(True, ["plain ", "text"])
+        self.assertEqual((agent.shown, content), (["plain ", "text"], "plain text"))
 
 
 class HardeningTests(unittest.TestCase):

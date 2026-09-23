@@ -8,7 +8,7 @@ It understands just enough of Claude Code's flags to exercise the bridge:
 The prompt is read from stdin, like the real CLI when no prompt argument is given. It answers
 "reply[<mode>] <prompt>" as stream-json (with a huge cumulative cache_read usage, like a real tool loop), and if the prompt contains
 USE_TOOL it also emits a Bash tool call first
-(after a 'Checking.' text block if it contains PREAMBLE). Every invocation is appended to $FAKE_CLAUDE_LOG (JSON lines).
+(after a 'Checking.' text block if it contains PREAMBLE; the tool takes $FAKE_CLAUDE_TOOL_SECONDS). Every invocation is appended to $FAKE_CLAUDE_LOG (JSON lines).
 Known sessions live in $FAKE_CLAUDE_STATE (a JSON list).
 Set FAKE_CLAUDE_SLEEP to make a run hang, and FAKE_CLAUDE_SPAWN_CHILD=1 to leave a grandchild holding stdout
 (the case that used to wedge the bridge's read loop past its timeout).
@@ -75,6 +75,9 @@ if "PREAMBLE" in prompt:
 if "USE_TOOL" in prompt:
     out({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "# list the files\nls -la"}}]}})
+    if os.environ.get("FAKE_CLAUDE_TOOL_SECONDS"):  # a slow tool: nothing on stdout meanwhile
+        import time
+        time.sleep(float(os.environ["FAKE_CLAUDE_TOOL_SECONDS"]))
 
 text = f"reply[{mode}] {prompt}"
 half = len(text) // 2

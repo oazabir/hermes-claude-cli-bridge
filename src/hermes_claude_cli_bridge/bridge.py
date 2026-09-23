@@ -42,10 +42,12 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 NAMESPACE = uuid.UUID("6f1d3a52-8c1e-4c5e-9a53-4d1f6f0c7b11")
 MODELS = ["sonnet", "opus", "haiku"]
-# Streamed on its own when the client asked for segments (the Hermes plugin does): "start a new chat message
-# here". The plugin turns it into Hermes' own segment break, so tool headlines and the answer land in separate
-# posts. U+2063 INVISIBLE SEPARATOR: never visible if some other path lets it through.
-SEGMENT_BREAK = "\u2063"
+# Streamed as content of their own when the client asked for segments (the Hermes plugin does). TEXT_RUN and
+# TOOL_RUN open a run of Claude text or tool headlines; FLUSH_TICK says "post the progress so far" (sent every
+# --flush-interval seconds while the turn produces output). The plugin maps them onto Hermes' own new-message
+# and interim-message machinery. Invisible format characters, in case some other path lets one through.
+TEXT_RUN, TOOL_RUN, FLUSH_TICK = "\u2063", "\u2064", "\u2062"
+MARKERS = re.compile("[\u2062\u2063\u2064]")
 
 CFG = argparse.Namespace()  # replaced by main(); getattr(..., default) until then
 _state_lock = threading.RLock()
@@ -179,10 +181,10 @@ def strip_memory_context(text: str) -> str:
 
 def _text(content) -> str:
     if isinstance(content, str):
-        return strip_memory_context(content).replace(SEGMENT_BREAK, "")
+        return MARKERS.sub("", strip_memory_context(content))
     if isinstance(content, list):
         return "\n".join(
-            strip_memory_context(p.get("text", "")).replace(SEGMENT_BREAK, "")
+            MARKERS.sub("", strip_memory_context(p.get("text", "")))
             for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text")
         )
     return ""
@@ -644,6 +646,10 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _sse(self, obj):
+        with self._write_lock:  # the flush ticker writes from its own thread
+            self._sse_unlocked(obj)
+
+    def _sse_unlocked(self, obj):
         self.wfile.write(b"data: " + (obj if isinstance(obj, bytes) else json.dumps(obj).encode()) + b"\n\n")
         self.wfile.flush()
 
@@ -654,6 +660,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+        self._write_lock = threading.Lock()
 
         def chunk(delta, finish=None, **extra):
             return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -666,12 +673,28 @@ class Handler(BaseHTTPRequestHandler):
             # text -> tools -> text: each run becomes its own chat message, like Hermes' own tool loop
             segments = bool((body.get("claude_bridge") or {}).get("segments"))
             last = [None]  # "text" | "tool": kind of the previous event
+            fresh = [False]  # output since the last FLUSH_TICK
+            done = threading.Event()
 
             def switch_to(kind):
-                if segments and last[0] not in (None, kind):
-                    self._sse(chunk({"content": SEGMENT_BREAK}))
+                fresh[0] = True
+                if segments and last[0] != kind:
+                    self._sse(chunk({"content": TEXT_RUN if kind == "text" else TOOL_RUN}))
                     line_start[0] = True
                 last[0] = kind
+
+            def ticker(every):
+                while not done.wait(every):
+                    if fresh[0]:
+                        fresh[0] = False
+                        try:
+                            self._sse(chunk({"content": FLUSH_TICK}))
+                        except OSError:
+                            return
+
+            tick = threading.Thread(target=ticker, args=(getattr(CFG, "flush_interval", 0),), daemon=True)
+            if segments and getattr(CFG, "flush_interval", 0) > 0:
+                tick.start()
 
             def on_text(t):
                 switch_to("text")
@@ -687,8 +710,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse(chunk({"content": ("" if line_start[0] else "\n") + ("  ↳ " if sub else "") + f"🔧 {headline}\n"}))
                     line_start[0] = True
 
-            res, sid = turn(body, on_text, lambda t: self._sse(chunk({"reasoning_content": t})),
-                            on_tool if CFG.tool_events != "off" or segments else None, client_gone=self._client_gone)
+            try:
+                res, sid = turn(body, on_text, lambda t: self._sse(chunk({"reasoning_content": t})),
+                                on_tool if CFG.tool_events != "off" or segments else None, client_gone=self._client_gone)
+            finally:
+                done.set()
+                if tick.is_alive():
+                    tick.join()  # no tick may land after the answer
             if not sent and res.get("result"):
                 self._sse(chunk({"content": res["result"]}))
             self._sse(chunk({}, "stop", usage=_usage(res, body, raw_len), claude_usage=res.get("usage")))
@@ -765,6 +793,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                          "compression sane) or Claude's raw cumulative usage")
     ap.add_argument("--tool-events", default=env("CLAUDE_BRIDGE_TOOL_EVENTS", "content"), choices=["content", "reasoning", "off"],
                     help="show Claude's tool calls to Hermes as one-line headlines: in the reply (content), in reasoning, or not at all")
+    ap.add_argument("--flush-interval", type=float, default=float(env("CLAUDE_BRIDGE_FLUSH_INTERVAL", "30")),
+                    help="with the Hermes plugin, post Claude's progress (text so far, tool calls) every N seconds on "
+                         "platforms that do not stream, e.g. Mattermost (default 30; 0 = only at the end)")
     ap.add_argument("--extra-args", default=env("CLAUDE_BRIDGE_EXTRA_ARGS", ""), help="raw extra claude flags (shlex-split)")
     a = ap.parse_args(argv)
     import shlex
