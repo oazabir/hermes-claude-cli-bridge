@@ -193,6 +193,14 @@ def _install_segment_breaks() -> bool:
                     if _post(self, [_pending_progress(self)] + head) and CHUNK_GAP > 0:
                         time.sleep(CHUNK_GAP)  # the reply must land after them
                     msg.content = last
+                elif self.stream_delta_callback is None and getattr(self, "interim_assistant_callback", None) \
+                        and 0 < CHUNK_CHARS < len(msg.content.strip()):
+                    # a turn that ends in tools keeps its whole text as the reply; still never let Hermes cut it
+                    # mid-line (an inline `code` span cut in two turns the rest of the post into one line)
+                    *head, last = _split(msg.content, CHUNK_CHARS)
+                    if _post(self, head) and CHUNK_GAP > 0:
+                        time.sleep(CHUNK_GAP)
+                    msg.content = last
             return resp
         finally:
             setattr(self, _RUNS, None)

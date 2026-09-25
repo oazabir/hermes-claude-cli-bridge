@@ -346,6 +346,16 @@ class PluginSegmentTests(unittest.TestCase):
         self.assertEqual("\n\n".join(chunks), "\n\n".join(paras), "cut only between paragraphs")
         self.assertGreater(len(chunks), 1)
 
+    def test_a_long_turn_ending_in_tools_is_split_at_lines_too(self):
+        self.mod.CHUNK_GAP = 0
+        heads = [f"🔧 Bash: `cd ~/projects/x{i} && grep -n something file{i}.js`\n" for i in range(120)]
+        agent, content = self.run_turn(False, [self.T, "Done.", self.O, *heads])
+        chunks = agent.interim + [content]
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c), 2000)
+            self.assertEqual(c.count("`") % 2, 0, "no inline code span cut in two")
+
     def test_short_answer_is_not_split(self):
         agent, content = self.run_turn(False, [self.T, "Short answer."])
         self.assertEqual((agent.interim, content), ([], "Short answer."))
