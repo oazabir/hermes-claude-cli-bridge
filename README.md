@@ -202,6 +202,8 @@ Always passed to `claude`: `-p --output-format stream-json --verbose --include-p
 
 **Per Hermes process** you can also set `CLAUDE_CODE_ADD_DIRS`, `CLAUDE_CODE_APPEND_SYSTEM_PROMPT`, `CLAUDE_CODE_AUTOCOMPACT`, `CLAUDE_CODE_EFFORT`, `CLAUDE_CODE_CWD` in Hermes' environment (they are merged with the bridge's values), and `CLAUDE_CODE_BRIDGE_URL` to point Hermes at a bridge on another port/host.
 
+On platforms where Hermes does not stream (e.g. Mattermost), the plugin posts long replies and progress as messages of at most `CLAUDE_CODE_CHUNK_CHARS` characters (default 2000; 0 = leave it to Hermes, which splits Mattermost posts at 4000 anywhere on a line and adds `(1/3)` tags). It splits at paragraph, then line, then sentence, then word boundaries, and never inside a fenced code block unless that block alone is over the limit (it is then closed and reopened). `CLAUDE_CODE_CHUNK_GAP` (default 0.5s) spaces the posts so they arrive in order. Only the reply's last chunk is kept in Hermes' history; the whole reply is in Claude's own session.
+
 ### Example: a coding assistant with project access and house rules
 
 ```bash

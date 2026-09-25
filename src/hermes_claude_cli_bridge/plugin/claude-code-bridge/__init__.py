@@ -11,12 +11,17 @@ Optional per-Hermes-process overrides (all also settable on the bridge):
   CLAUDE_CODE_AUTOCOMPACT         'auto' or 100k-1M -> --autocompact
   CLAUDE_CODE_EFFORT              low|medium|high|xhigh|max -> --effort
   CLAUDE_CODE_CWD                 working dir for claude
+
+Plugin-only (non-streaming platforms such as Mattermost):
+  CLAUDE_CODE_CHUNK_CHARS         max chars per posted message, default 2000; 0 = leave splitting to Hermes
+  CLAUDE_CODE_CHUNK_GAP           seconds between consecutive posts so they land in order, default 0.5
 """
 
 from __future__ import annotations
 
 import os
 import re
+import time
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -34,24 +39,107 @@ TEXT_RUN, TOOL_RUN, FLUSH_TICK = "\u2063", "\u2064", "\u2062"
 _MARKERS = re.compile("([\u2062\u2063\u2064])")
 _RUNS = "_claude_bridge_runs"  # per-call state on the agent: [[kind, text, chars already posted], ...]
 
+# Hermes' own Mattermost split is 4000 chars at an arbitrary line/space with "(1/3)" tags; posts that long break
+# up in the Mattermost view. Each message is posted pre-split instead, at paragraph > line > sentence > word
+# boundaries, with fenced code blocks kept whole (or closed and reopened when one alone is over the limit).
+CHUNK_CHARS = int(os.getenv("CLAUDE_CODE_CHUNK_CHARS") or 2000)
+CHUNK_GAP = float(os.getenv("CLAUDE_CODE_CHUNK_GAP") or 0.5)  # Hermes posts interim messages fire-and-forget
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+_SEPS = ((re.compile(r"\n"), "\n"), (re.compile(r"(?<=[.!?])\s+"), " "), (re.compile(r" +"), " "))
 
-def _post_progress(agent) -> None:
-    """Post runs not yet shown as one interim message. Text still streaming may be the answer, so it waits
-    until the next run starts; at the end the last text run IS the answer and is left for the reply."""
-    runs = getattr(agent, _RUNS, None) or []
+
+def _units(text):
+    """Blank-line separated paragraphs, each fenced code block a unit of its own, blank lines and all."""
+    units, cur, fence = [], [], None
+    for line in text.split("\n"):
+        m = _FENCE.match(line)
+        if fence is None and (m or not line.strip()):
+            if cur:
+                units.append("\n".join(cur))
+            cur, fence = [], m.group(1) if m else None
+            if not m:
+                continue
+        elif fence and line.strip().startswith(fence) and not line.strip().strip(fence[0]):
+            units.append("\n".join(cur + [line]))
+            cur, fence = [], None
+            continue
+        cur.append(line)
+    return units + ["\n".join(cur)] if cur else units
+
+
+def _pack(text, limit, seps=_SEPS):
+    """Greedily pack text into <= limit pieces, splitting at the coarsest separator that fits."""
+    if len(text) <= limit:
+        return [text]
+    if not seps:
+        return [text[i:i + limit] for i in range(0, len(text), limit)]
+    (rx, join), out, cur = seps[0], [], None
+    for part in rx.split(text):
+        for p in _pack(part, limit, seps[1:]):
+            if cur is not None and len(cur) + len(join) + len(p) <= limit:
+                cur += join + p
+            else:
+                out += [] if cur is None else [cur]
+                cur = p
+    return out + ([] if cur is None else [cur])
+
+
+def _split(text, limit):
+    text = text.strip()
+    if limit <= 0 or len(text) <= limit:
+        return [text] if text else []
+    out, cur = [], ""
+    for unit in _units(text):
+        m = _FENCE.match(unit)
+        if len(unit) <= limit:
+            pieces = [unit]
+        elif m:  # a code block alone is too long: split it by lines, closing and reopening the fence
+            head, *body = unit.split("\n")
+            if body and body[-1].strip().startswith(m.group(1)):
+                body.pop()
+            close = "\n" + m.group(1)
+            room = max(1, limit - len(head) - len(close) - 1)
+            pieces = [f"{head}\n{b}{close}" for b in _pack("\n".join(body), room, _SEPS[:1])]
+        else:
+            pieces = _pack(unit, limit)
+        for p in pieces:
+            if cur and len(cur) + 2 + len(p) > limit:
+                out.append(cur)
+                cur = ""
+            cur = f"{cur}\n\n{p}" if cur else p
+    return [c for c in out + [cur] if c.strip()]
+
+
+def _post(agent, texts) -> bool:
+    """Post each text as interim message(s) of at most CHUNK_CHARS, in order. True if anything was posted."""
     cb = getattr(agent, "interim_assistant_callback", None)
+    posted = False
+    for chunk in (c for t in texts for c in _split(t, CHUNK_CHARS)) if cb else ():
+        if posted and CHUNK_GAP > 0:
+            time.sleep(CHUNK_GAP)
+        try:
+            cb(chunk, already_streamed=False)
+            posted = True
+        except Exception:
+            pass
+    return posted
+
+
+def _pending_progress(agent) -> str:
+    """Runs not yet shown. Text still streaming may be the answer, so it waits until the next run starts; at
+    the end the last text run IS the answer and is left for the reply."""
+    runs = getattr(agent, _RUNS, None) or []
     parts = []
     for i, run in enumerate(runs):
         if run[0] == "text" and i == len(runs) - 1:
             break
         parts.append(run[1][run[2]:].strip())
         run[2] = len(run[1])
-    text = "\n".join(p for p in parts if p)
-    if text and cb:
-        try:
-            cb(text, already_streamed=False)
-        except Exception:
-            pass
+    return "\n".join(p for p in parts if p)
+
+
+def _post_progress(agent) -> None:
+    _post(agent, [_pending_progress(agent)])
 
 
 def _install_segment_breaks() -> bool:
@@ -99,8 +187,12 @@ def _install_segment_breaks() -> bool:
                 msg.content = _MARKERS.sub("", msg.content)
                 answer = runs[-1][1].strip() if runs and runs[-1][0] == "text" else ""
                 if self.stream_delta_callback is None and getattr(self, "interim_assistant_callback", None) and answer:
-                    _post_progress(self)
-                    msg.content = answer
+                    # all but the answer's last chunk go out as interim messages; that chunk is the reply, so
+                    # Hermes (which keeps msg.content as the turn's history) never re-splits it
+                    *head, last = _split(answer, CHUNK_CHARS)
+                    if _post(self, [_pending_progress(self)] + head) and CHUNK_GAP > 0:
+                        time.sleep(CHUNK_GAP)  # the reply must land after them
+                    msg.content = last
             return resp
         finally:
             setattr(self, _RUNS, None)

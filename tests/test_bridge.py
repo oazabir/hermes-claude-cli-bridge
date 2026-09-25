@@ -336,6 +336,44 @@ class PluginSegmentTests(unittest.TestCase):
         agent, content = self.run_turn(True, ["plain ", "text"])
         self.assertEqual((agent.shown, content), (["plain ", "text"], "plain text"))
 
+    def test_long_answer_is_posted_in_clean_chunks_and_the_reply_is_the_last(self):
+        self.mod.CHUNK_GAP = 0
+        paras = [f"Paragraph {i}. " + ("word " * 80).strip() for i in range(12)]  # ~420 chars each
+        agent, content = self.run_turn(False, [self.T, "Checking.", self.O, "🔧 Bash\n", self.T, "\n\n".join(paras)])
+        chunks = agent.interim[1:] + [content]
+        self.assertEqual(agent.interim[0], "Checking.\n🔧 Bash", "progress stays its own message")
+        self.assertTrue(all(len(c) <= 2000 for c in chunks), [len(c) for c in chunks])
+        self.assertEqual("\n\n".join(chunks), "\n\n".join(paras), "cut only between paragraphs")
+        self.assertGreater(len(chunks), 1)
+
+    def test_short_answer_is_not_split(self):
+        agent, content = self.run_turn(False, [self.T, "Short answer."])
+        self.assertEqual((agent.interim, content), ([], "Short answer."))
+
+    def test_split_keeps_code_blocks_whole_and_reopens_oversized_ones(self):
+        split = self.mod._split
+        block = "```python\n" + "\n".join(f"x{i} = {i}" for i in range(20)) + "\n```"
+        text = "intro " * 300 + "\n\n" + block + "\n\nafter"
+        chunks = split(text, 2000)
+        self.assertTrue(any(block in c for c in chunks), "the whole block lands in one message")
+        big = "```sh\n" + "\n".join("echo " + "y" * 40 for _ in range(100)) + "\n```"
+        chunks = split(big, 2000)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c), 2000)
+            self.assertTrue(c.startswith("```sh\n") and c.endswith("\n```"), c[:20] + "..." + c[-20:])
+        self.assertEqual(sum(c.count("echo ") for c in chunks), 100)
+
+    def test_split_falls_back_to_sentences_then_words_then_hard_cuts(self):
+        split = self.mod._split
+        one_para = " ".join(f"Sentence number {i} is here." for i in range(200))
+        chunks = split(one_para, 500)
+        self.assertTrue(all(len(c) <= 500 and c.endswith(".") for c in chunks))
+        self.assertEqual(" ".join(chunks), one_para)
+        self.assertEqual(split("z" * 1200, 500), ["z" * 500, "z" * 500, "z" * 200])
+        self.assertEqual(split("  ", 500), [])
+        self.assertEqual(split("a\n\nb", 0), ["a\n\nb"], "0 = off")
+
 
 class HardeningTests(unittest.TestCase):
     """The fixes from the 2026-09-21 review: argv limit, process groups, CSRF, limits, housekeeping."""
