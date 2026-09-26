@@ -33,6 +33,16 @@ class CliTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         # Path.home() reads HOME on POSIX, so the sandbox applies to service paths too
+        # Never touch the real service manager: the unit and agent names are the same as a real install's, so an
+        # unstubbed `uninstall` ran `systemctl --user disable --now claude-bridge.service` on the host and stopped a
+        # production bridge (twice, 2026-09-26). Every call is recorded instead.
+        self.service_calls = []
+        svc = mock.patch.object(cli, "_try", side_effect=lambda cmd, quiet=True: self.service_calls.append(cmd) or 0)
+        svc.start()
+        self.addCleanup(svc.stop)
+        tty = mock.patch.object(sys.stdin, "isatty", return_value=False)  # never block on the prompts question
+        tty.start()
+        self.addCleanup(tty.stop)
 
     def test_version_and_help(self):
         rc, out, _ = run("version")
@@ -114,6 +124,46 @@ class CliTests(unittest.TestCase):
         unit = self.home / ".config" / "systemd" / "user" / "claude-bridge.service"
         self.assertIn('"--model" "opus"', unit.read_text())
 
+    def _unit_after_install(self, *flags, tty=False, answer=""):
+        with mock.patch.object(sys.stdin, "isatty", return_value=tty), \
+             mock.patch("builtins.input", return_value=answer) as asked:
+            rc, out, _ = run("install", "--service", "--no-start", "--os", "linux", "--command", "/x/b", *flags)
+        self.assertEqual(rc, 0)
+        return (self.home / ".config" / "systemd" / "user" / "claude-bridge.service").read_text(), asked.called
+
+    def test_install_prompts_flag_adds_bundled_prompts(self):
+        unit, asked = self._unit_after_install("--prompts", "all", tty=True)
+        self.assertIn('"--prompt" "all"', unit)
+        self.assertFalse(asked, "an explicit --prompts is never asked again")
+        unit, asked = self._unit_after_install("--prompts", "agents,self-learn")
+        self.assertIn('"--prompt" "agents" "--prompt" "self-learn"', unit)
+
+    def test_install_asks_once_and_defaults_to_no(self):
+        unit, asked = self._unit_after_install(tty=True, answer="")
+        self.assertTrue(asked)
+        self.assertNotIn("--prompt", unit)
+        unit, _ = self._unit_after_install(tty=True, answer="y")
+        self.assertIn('"--prompt" "all"', unit)
+
+    def test_install_never_asks_without_a_terminal_or_with_none(self):
+        unit, asked = self._unit_after_install(tty=False)
+        self.assertFalse(asked)
+        self.assertNotIn("--prompt", unit)
+        unit, asked = self._unit_after_install("--prompts", "none", tty=True)
+        self.assertFalse(asked)
+        self.assertNotIn("--prompt", unit)
+
+    def test_none_in_a_list_is_ignored(self):
+        unit, _ = self._unit_after_install("--prompts", "none,agents")
+        self.assertIn('"--prompt" "agents"', unit)
+        self.assertNotIn('"none"', unit)
+
+    def test_install_rejects_an_unknown_prompt_name(self):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            cli.main(["install", "--service", "--no-start", "--os", "linux", "--command", "/x/b", "--prompts", "nope"])
+        self.assertIn("unknown prompt 'nope' (choose from agents, self-learn, subagents, all)", err.getvalue())
+
     def test_uninstall_removes_only_what_install_added(self):
         (self.hh).mkdir()
         (self.hh / ".env").write_text("FOO=bar\n")
@@ -123,6 +173,12 @@ class CliTests(unittest.TestCase):
         self.assertFalse((self.hh / "plugins" / "model-providers" / "claude-code-bridge").exists())
         self.assertEqual((self.hh / ".env").read_text(), "FOO=bar\n")
         self.assertFalse((self.home / ".config" / "systemd" / "user" / "claude-bridge.service").exists())
+
+    def test_service_commands_never_reach_the_real_service_manager(self):
+        run("install", "--service", "--os", "linux", "--command", "/x/b")
+        run("uninstall", "--os", "linux")
+        self.assertIn(["systemctl", "--user", "enable", "--now", "claude-bridge.service"], self.service_calls)
+        self.assertIn(["systemctl", "--user", "disable", "--now", "claude-bridge.service"], self.service_calls)
 
     def test_uninstall_leaves_a_foreign_plugin_alone(self):
         other = self.hh / "plugins" / "model-providers" / "claude-code-bridge"

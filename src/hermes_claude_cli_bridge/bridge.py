@@ -645,6 +645,23 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     return result, "".join(stderr_buf)
 
 
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+PROMPTS = ("agents", "self-learn", "subagents")  # opt-in prompt files shipped with the package; "all" = every one
+
+
+def resolve_prompts(names: list[str]) -> list[str]:
+    """Paths of the bundled prompt files for --prompt names, in the order asked, duplicates dropped."""
+    out: list[str] = []
+    for name in names:
+        for n in (PROMPTS if name == "all" else (name,)):
+            if n not in PROMPTS:
+                raise ValueError(f"unknown prompt '{name}' (choose from {', '.join(PROMPTS)}, all)")
+            path = str(PROMPTS_DIR / f"{n}.md")
+            if path not in out:
+                out.append(path)
+    return out
+
+
 _prompt_cache: dict[str, tuple[tuple[int, int], str]] = {}
 
 
@@ -982,6 +999,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--append-system-prompt-file", action="append",
                     default=[f for f in env("CLAUDE_BRIDGE_APPEND_SYSTEM_PROMPT_FILE", "").split(os.pathsep) if f],
                     help="file appended to the system prompt, in order (repeatable; env os.pathsep-separated); re-read every request")
+    ap.add_argument("--prompt", action="append", default=None,
+                    help="add a prompt file shipped with the bridge, before any --append-system-prompt-file (repeatable; env "
+                         "CLAUDE_BRIDGE_PROMPTS, comma separated): agents (chat, safety and approval rules), self-learn (save "
+                         "reusable procedures as Claude Code skills), subagents (delegate by model), or all. Default: none")
     ap.add_argument("--effort", default=env("CLAUDE_BRIDGE_EFFORT", "medium"), choices=["", "low", "medium", "high", "xhigh", "max"],
                     help="passed as --effort (default medium; '' = claude default)")
     ap.add_argument("--autocompact", default=env("CLAUDE_BRIDGE_AUTOCOMPACT", "auto"),
@@ -1036,6 +1057,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     import shlex
     a.extra_args = shlex.split(a.extra_args)
     a.add_dir = [str(Path(d).expanduser()) for d in a.add_dir]
+    try:
+        names = a.prompt if a.prompt is not None else env("CLAUDE_BRIDGE_PROMPTS", "").split(",")  # the flag replaces the env var
+        a.append_system_prompt_file = resolve_prompts([n.strip() for n in names if n.strip()]) + a.append_system_prompt_file
+    except ValueError as e:
+        ap.error(str(e))
     return a
 
 

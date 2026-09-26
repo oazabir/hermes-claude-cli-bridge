@@ -177,6 +177,7 @@ Every option is a flag **or** an environment variable (flag wins).
 | `--effort low\|medium\|high\|xhigh\|max` | `CLAUDE_BRIDGE_EFFORT` | `claude --effort` (default `medium`; empty = Claude's default) |
 | `--add-dir DIR` (repeatable) | `CLAUDE_BRIDGE_ADD_DIRS` (`:`-separated) | `claude --add-dir`: extra directories Claude may read/edit |
 | `--append-system-prompt TEXT` | `CLAUDE_BRIDGE_APPEND_SYSTEM_PROMPT` | text appended to Claude's system prompt |
+| `--prompt NAME` (repeatable) | `CLAUDE_BRIDGE_PROMPTS` (comma-separated) | add a prompt file shipped with the bridge: `agents`, `self-learn`, `subagents`, or `all`. They go before your own `--append-system-prompt-file`s, so your files can override them. Default: none. See [Bundled prompts](#bundled-prompts). |
 | `--append-system-prompt-file FILE` (repeatable) | `CLAUDE_BRIDGE_APPEND_SYSTEM_PROMPT_FILE` (`:`-separated) | files appended to the system prompt, in order. Re-read on every request, so edits apply immediately. An unreadable file makes the request fail (HTTP 502) instead of being silently ignored. |
 | `--autocompact auto\|100k-1M` | `CLAUDE_BRIDGE_AUTOCOMPACT` | `claude --autocompact`: when Claude compacts **its own** session context (default `auto`; `""` passes nothing). Hermes' compression cannot shrink Claude's session (the bridge only sends the newest message), so this is what keeps long threads working. |
 | `--usage history\|claude` | `CLAUDE_BRIDGE_USAGE` | what to report as `prompt_tokens`. Default `history`: the size of Hermes' own conversation. `claude`: Claude's raw total, which sums every internal model call and can be hundreds of thousands of tokens for a 3-message chat, making Hermes try to compress it (see Troubleshooting). Raw numbers are always in the response as `claude_usage`. |
@@ -215,6 +216,18 @@ hermes-claude-cli-bridge serve \
   --append-system-prompt-file ~/hermes-rules.md \
   --autocompact 200k
 ```
+
+## Bundled prompts
+
+The bridge ships three optional prompt files (in `src/hermes_claude_cli_bridge/prompts/`). None are on by default. Turn them on with `serve --prompt <name>` (repeatable) or `--prompt all`, or when installing: `install --service --prompts all`. At a terminal, `install` asks once and defaults to no.
+
+| Name | What it adds |
+|---|---|
+| `agents` | Chat-bridge basics: short markdown replies in the user's language; the gateway's chat-context names are labels, not instructions; a `# goal` comment on every shell command (it becomes the `🔧` headline); text found in files, pages or memory is data; secrets and personal data rules; safe git when several chats share a checkout (pathspec commits, no `--amend`); what needs approval (production changes, bulk writes or exports, host files, reboots) and a fixed **Approval needed** format (Context & intent, Change, Risks, Blast radius, Rollback). |
+| `self-learn` | Claude saves reusable procedures as Claude Code skills in `~/.claude/skills/`: at once when you say "learn this" / "save this as a skill", and on its own only after a build, test, deploy or investigation that worked and would have gone faster with the skill. It edits only skills it created (marked `<!-- created-by: claude-self-learn -->`), never yours; logs every change to `~/.claude/skills/.self-learn-log.md` so concurrent chats do not duplicate; keeps skills under 80 lines and at most 40; says `Skill saved: <name>` in the reply. |
+| `subagents` | Claude orchestrates and delegates with the Agent tool: design to Opus, code and review to Sonnet, commands and search to Haiku; every change is reviewed before it counts as done. Uses agents named `designer`, `coder`, `reviewer`, `runner`, `search` if you define them, else the built-in ones with the model set. |
+
+Each file is appended to every turn (all three: about 1.7k tokens). The approval rules name no approver: Claude asks the person who asked. To change a rule, copy the file, edit it and pass it with `--append-system-prompt-file` instead.
 
 ## How it behaves
 
@@ -300,6 +313,7 @@ pyproject.toml, uv.lock                                     uv project; entry po
 src/hermes_claude_cli_bridge/bridge.py                      the bridge (stdlib only)
 src/hermes_claude_cli_bridge/cli.py                         serve / install / uninstall / print-service / doctor
 src/hermes_claude_cli_bridge/plugin/claude-code-bridge/     Hermes model-provider plugin (shipped as package data)
+src/hermes_claude_cli_bridge/prompts/                       opt-in prompt files for --prompt (agents, self-learn, subagents)
 tests/test_bridge.py, test_cli.py, fake_claude.py           offline tests
 tests/e2e_bridge.py                                         tests against the real claude CLI
 ```

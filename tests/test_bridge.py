@@ -2,6 +2,8 @@
 """Offline tests for the bridge. Uses tests/fake_claude.py instead of the real `claude`, so it needs no login,
 no network and costs nothing:   uv run python -m unittest discover -s tests -v
 (For a check against the real CLI, run tests/e2e_bridge.py.)"""
+import contextlib
+import io
 import json
 import os
 import socket
@@ -11,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -633,6 +636,53 @@ class WatchdogTests(unittest.TestCase):
     def test_no_stats_when_disabled(self):
         text, _ = self._run("--stats-interval", "0", FAKE_CLAUDE_TOOL_SECONDS="2.5", FAKE_CLAUDE_TOOL_MODE="busy")
         self.assertNotIn("📊", text)
+
+
+class BundledPromptTests(unittest.TestCase):
+    """Opt-in prompt files shipped with the package: --prompt agents|self-learn|subagents|all."""
+
+    def _prompt(self, *args, **env):
+        b = Bridge(*args, **env)
+        try:
+            b.chat("hi", "thread-prompt")
+            (call,) = b.calls()
+            return call[call.index("--append-system-prompt") + 1]
+        finally:
+            b.stop()
+
+    def test_names_resolve_to_packaged_files(self):
+        files = bridge.resolve_prompts(["all"])
+        self.assertEqual([Path(f).name for f in files], ["agents.md", "self-learn.md", "subagents.md"])
+        self.assertTrue(all(Path(f).is_file() for f in files))
+        self.assertEqual(bridge.resolve_prompts(["self-learn", "agents", "self-learn"]),
+                         [str(Path(files[1])), str(Path(files[0]))], "order kept, duplicates dropped")
+        self.assertEqual(bridge.resolve_prompts([]), [])
+        with self.assertRaises(ValueError):
+            bridge.resolve_prompts(["nope"])
+
+    def test_prompt_flag_reaches_claude_before_the_operators_own_file(self):
+        prompt = self._prompt("--prompt", "self-learn", "--prompt", "subagents")
+        self.assertIn("created-by: claude-self-learn", prompt)
+        self.assertIn("| Code search |", prompt)
+        self.assertNotIn("Shared checkouts", prompt, "agents.md was not asked for")
+        self.assertLess(prompt.index("claude-self-learn"), prompt.index("Always answer briefly."),
+                        "the operator's own prompt file comes last, so it can override")
+
+    def test_env_var_and_default_off(self):
+        self.assertIn("Shared checkouts", self._prompt(CLAUDE_BRIDGE_PROMPTS="agents,self-learn"))
+        self.assertNotIn("claude-self-learn", self._prompt())
+
+    def test_flag_replaces_the_env_var(self):
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_BRIDGE_PROMPTS": "agents"}):
+            self.assertEqual([Path(f).name for f in bridge.parse_args(["--prompt", "subagents"]).append_system_prompt_file],
+                             ["subagents.md"])
+            self.assertEqual([Path(f).name for f in bridge.parse_args([]).append_system_prompt_file], ["agents.md"])
+
+    def test_unknown_prompt_name_stops_startup(self):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            bridge.parse_args(["--prompt", "nope"])
+        self.assertIn("unknown prompt 'nope' (choose from agents, self-learn, subagents, all)", err.getvalue())
 
 
 class HelperTests(unittest.TestCase):

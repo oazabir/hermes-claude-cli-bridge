@@ -295,14 +295,44 @@ def _install_parser(prog: str, service_flags: bool) -> argparse.ArgumentParser:
     ap.add_argument("--os", choices=["linux", "macos"], help="service flavour (default: auto-detect)")
     ap.add_argument("--command", help=f"absolute path of the {DIST} executable the service should run (default: auto)")
     if service_flags:
+        ap.add_argument("--prompts", metavar="NAMES",
+                        help="bundled prompt files to enable: comma list of agents, self-learn, subagents, or all / none "
+                             "(default: ask when run in a terminal, else none)")
         ap.add_argument("--service", action="store_true", help="also install and start a background service (systemd user unit / launchd agent)")
         ap.add_argument("--no-start", action="store_true", help="write the service file but do not start it")
     return ap
 
 
+PROMPT_QUESTION = ("Enable the bundled prompts (chat and safety rules, self-learning skills, subagent routing)? "
+                   "They are appended to every Claude turn; see README 'Bundled prompts'. [y/N] ")
+
+
+def choose_prompts(choice: str | None, extra: list[str]) -> list[str]:
+    """--prompt names for the bridge: from --prompts, else one question at a terminal (default no), else none.
+    Flags already passed after `--` win: the operator chose."""
+    if any(x == "--prompt" or x.startswith("--prompt=") for x in extra):
+        return []
+    if choice is not None:
+        names = [n.strip() for n in choice.split(",") if n.strip() and n.strip() != "none"]
+        from .bridge import resolve_prompts
+        resolve_prompts(names)  # ValueError on an unknown name
+        return names
+    if not sys.stdin.isatty():
+        return []
+    try:
+        return ["all"] if input(PROMPT_QUESTION).strip().lower() in ("y", "yes") else []
+    except EOFError:
+        return []
+
+
 def cmd_install(argv: list[str]) -> int:
     own, extra = _split(argv)
-    a = _install_parser("install", True).parse_args(own)
+    ap = _install_parser("install", True)
+    a = ap.parse_args(own)
+    try:
+        extra = extra + [x for n in choose_prompts(a.prompts, extra) for x in ("--prompt", n)]
+    except ValueError as e:
+        ap.error(str(e))
     home = hermes_home(a.hermes_home)
     if not shutil.which("claude"):
         _warn("'claude' not found on PATH. Install Claude Code and run `claude` once to log in: https://docs.anthropic.com/en/docs/claude-code")
