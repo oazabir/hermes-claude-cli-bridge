@@ -638,6 +638,29 @@ class WatchdogTests(unittest.TestCase):
         self.assertNotIn("📊", text)
 
 
+class BackgroundCeilingTests(unittest.TestCase):
+    """claude -p waits only 10 min (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS) for background subagents after the main
+    turn ends, then interrupts them and exits. The bridge makes that ceiling its own --timeout instead."""
+
+    def _ceiling(self, *args, **env):
+        b = Bridge(*args, **env)
+        try:
+            b.chat("hi", "thread-bg")
+            return json.loads(b.log.read_text().splitlines()[0])["bg_ceiling"]
+        finally:
+            b.stop()
+
+    def test_ceiling_follows_the_turn_limit(self):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(self._ceiling(), "1800000")
+            self.assertEqual(self._ceiling("--timeout", "900"), "900000")
+            self.assertEqual(self._ceiling("--timeout", "0"), "0", "no cap: wait for background work indefinitely")
+
+    def test_an_operator_setting_wins(self):
+        self.assertEqual(self._ceiling(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="12345"), "12345")
+
+
 class BundledPromptTests(unittest.TestCase):
     """Opt-in prompt files shipped with the package: --prompt agents|self-learn|subagents|all."""
 

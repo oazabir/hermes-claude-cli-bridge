@@ -486,11 +486,22 @@ def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None
         _slots.release()
 
 
+def claude_env() -> dict:
+    """claude's environment. After the main turn ends, `claude -p` waits for background subagents only up to
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (10 min by default), then interrupts them and exits, so a chat that asked
+    for long background work lost it at 10 minutes. The bridge's own --timeout (plus the idle watchdog) is the
+    limit that should apply; 0 = no cap. An operator's own setting wins."""
+    env = dict(os.environ)
+    cap = getattr(CFG, "timeout", 0) or 0
+    env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", str(int(cap * 1000)) if cap > 0 else "0")
+    return env
+
+
 def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None,
                 on_stats=None):
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
+        stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True, env=claude_env(),
     )
     # the prompt goes on stdin (no 128 KB argv limit); feed it from a thread so a child that
     # does not drain stdin cannot deadlock us on a full pipe buffer

@@ -26,7 +26,8 @@ state_path = os.environ.get("FAKE_CLAUDE_STATE")
 
 if log:
     with open(log, "a") as f:
-        f.write(json.dumps({"argv": argv, "prompt": prompt, "pgid": os.getpgid(0)}) + "\n")
+        f.write(json.dumps({"argv": argv, "prompt": prompt, "pgid": os.getpgid(0),
+                            "bg_ceiling": os.environ.get("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS")}) + "\n")
 
 if os.environ.get("FAKE_CLAUDE_SPAWN_CHILD") == "1":
     # a grandchild that inherits stdout and outlives us, exactly like a `claude` Bash tool call
