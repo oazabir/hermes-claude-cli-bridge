@@ -138,6 +138,12 @@ class CliTests(unittest.TestCase):
         unit, asked = self._unit_after_install("--prompts", "agents,self-learn")
         self.assertIn('"--prompt" "agents" "--prompt" "self-learn"', unit)
 
+    def test_install_accepts_prompt_as_an_alias(self):
+        unit, asked = self._unit_after_install("--prompt", "all", tty=True)
+        self.assertIn('"--prompt" "all"', unit)
+        self.assertFalse(asked)
+        self.assertRegex(cli._install_parser("install", True).format_help(), r"--prompts( NAMES)?, --prompt NAMES")
+
     def test_install_asks_once_and_defaults_to_no(self):
         unit, asked = self._unit_after_install(tty=True, answer="")
         self.assertTrue(asked)

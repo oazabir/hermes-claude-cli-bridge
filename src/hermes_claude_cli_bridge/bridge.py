@@ -679,6 +679,8 @@ def _read_prompt_file(path: str) -> str:
         text = p.read_text().strip()
     except OSError as e:
         raise RuntimeError(f"cannot read --append-system-prompt-file {path}: {e}") from e
+    if p.resolve().parent == PROMPTS_DIR:  # our own files only: an operator's prompt is passed through untouched
+        text = text.replace("{{NOTES_DIR}}", str(Path(getattr(CFG, "notes_dir", "~/.claude/notes")).expanduser()))
     _prompt_cache[path] = (stamp, text)
     return text
 
@@ -1003,6 +1005,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="add a prompt file shipped with the bridge, before any --append-system-prompt-file (repeatable; env "
                          "CLAUDE_BRIDGE_PROMPTS, comma separated): agents (chat, safety and approval rules), self-learn (save "
                          "reusable procedures as Claude Code skills), subagents (delegate by model), or all. Default: none")
+    ap.add_argument("--notes-dir", default=env("CLAUDE_BRIDGE_NOTES_DIR", "~/.claude/notes"),
+                    help="where the bundled prompts keep MISTAKES.md, MISTAKES-<type>.md and LOG.md (default ~/.claude/notes)")
     ap.add_argument("--effort", default=env("CLAUDE_BRIDGE_EFFORT", "medium"), choices=["", "low", "medium", "high", "xhigh", "max"],
                     help="passed as --effort (default medium; '' = claude default)")
     ap.add_argument("--autocompact", default=env("CLAUDE_BRIDGE_AUTOCOMPACT", "auto"),

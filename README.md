@@ -47,10 +47,22 @@ export BRIDGE_SRC=git+https://github.com/oazabir/hermes-claude-cli-bridge   # ad
 
 ```bash
 uv tool install $BRIDGE_SRC                     # puts `hermes-claude-cli-bridge` on your PATH (in an isolated, uv-managed environment)
-hermes-claude-cli-bridge install --service      # Hermes plugin + gateway env line + a background service (systemd on Linux, launchd on macOS)
+hermes-claude-cli-bridge install --service --prompt all   # Hermes plugin + gateway env line + a background service (systemd on Linux, launchd on macOS) + the bundled prompts
 hermes-claude-cli-bridge doctor                 # checks claude, hermes, the plugin, the env line and that the bridge answers
 hermes chat --provider claude-code-bridge -m sonnet
 ```
+
+**Why `--prompt all` (recommended).** It turns Claude Code into a careful chat agent instead of a bare coding CLI. Claude then:
+
+- **learns**: saves procedures that worked (builds, deploys, investigations) as Claude Code skills, so the next run is faster and right first time; say "learn this" and it saves one on the spot;
+- **does not repeat mistakes**: records each mistake by type (`MISTAKES-build.md`, `MISTAKES-deploy.md`, …) under an index, and reads them before it builds, tests, deploys or changes a system;
+- **keeps a change log**: one line per turn that changed something, with time, who asked and what was done (`LOG.md`);
+- **asks before risky work**: production changes, bulk writes, large exports, reboots — with a fixed approval format (context, change, risks, blast radius, rollback);
+- **stays safe in chat**: treats names and text found in files, pages or memory as data, not orders; handles secrets and personal data carefully; commits safely when several chats share a checkout;
+- **delegates by model**: plans itself, hands code and reviews to Sonnet and commands to Haiku, so turns are cheaper and every change is reviewed;
+- **shows readable progress**: every command carries a short goal comment, which the chat shows as the step headline.
+
+It costs about 2.3k tokens per turn. Notes go to `~/.claude/notes/` (`--notes-dir` to change). Leave it out for a plain Claude Code, or pick parts: `--prompt agents --prompt self-learn`. Details: [Bundled prompts](#bundled-prompts).
 
 If `uv tool install` says the tool directory is not on your `PATH`, run `uv tool update-shell` and open a new terminal.
 
@@ -58,7 +70,7 @@ If `uv tool install` says the tool directory is not on your `PATH`, run `uv tool
 
 ```bash
 uvx --from $BRIDGE_SRC hermes-claude-cli-bridge install     # plugin + gateway env line
-uvx --from $BRIDGE_SRC hermes-claude-cli-bridge serve --model sonnet     # run the bridge in this terminal (Ctrl-C stops it)
+uvx --from $BRIDGE_SRC hermes-claude-cli-bridge serve --model sonnet --prompt all     # run the bridge in this terminal (Ctrl-C stops it)
 # in another terminal:
 hermes chat --provider claude-code-bridge -m sonnet
 ```
@@ -77,7 +89,7 @@ The provider is named **`claude-code-bridge`** (aliases `claude-bridge`, `claude
 
 Step 2 matters for the **messaging gateway**: it reads provider settings from `.env` (not from the shell or the service environment). Without that line the gateway cannot resolve the provider and quietly falls back to your other model.
 
-Options: `--port N` (default 9181), `--hermes-home DIR`, `--service`, `--no-start`, `--os linux|macos`, `--command PATH` (the executable the service runs; default auto). Everything after `--` is passed to the bridge, see [Run it as a service](#run-it-as-a-service).
+Options: `--port N` (default 9181), `--hermes-home DIR`, `--service`, `--no-start`, `--prompt all|none|<names>` (bundled prompts for the service; asked once at a terminal if omitted), `--os linux|macos`, `--command PATH` (the executable the service runs; default auto). Everything after `--` is passed to the bridge, see [Run it as a service](#run-it-as-a-service).
 
 ### Commands
 
@@ -178,6 +190,7 @@ Every option is a flag **or** an environment variable (flag wins).
 | `--add-dir DIR` (repeatable) | `CLAUDE_BRIDGE_ADD_DIRS` (`:`-separated) | `claude --add-dir`: extra directories Claude may read/edit |
 | `--append-system-prompt TEXT` | `CLAUDE_BRIDGE_APPEND_SYSTEM_PROMPT` | text appended to Claude's system prompt |
 | `--prompt NAME` (repeatable) | `CLAUDE_BRIDGE_PROMPTS` (comma-separated) | add a prompt file shipped with the bridge: `agents`, `self-learn`, `subagents`, or `all`. They go before your own `--append-system-prompt-file`s, so your files can override them. Default: none. See [Bundled prompts](#bundled-prompts). |
+| `--notes-dir DIR` | `CLAUDE_BRIDGE_NOTES_DIR` | where the bundled prompts keep `MISTAKES.md`, `MISTAKES-<type>.md` and `LOG.md` (default `~/.claude/notes`) |
 | `--append-system-prompt-file FILE` (repeatable) | `CLAUDE_BRIDGE_APPEND_SYSTEM_PROMPT_FILE` (`:`-separated) | files appended to the system prompt, in order. Re-read on every request, so edits apply immediately. An unreadable file makes the request fail (HTTP 502) instead of being silently ignored. |
 | `--autocompact auto\|100k-1M` | `CLAUDE_BRIDGE_AUTOCOMPACT` | `claude --autocompact`: when Claude compacts **its own** session context (default `auto`; `""` passes nothing). Hermes' compression cannot shrink Claude's session (the bridge only sends the newest message), so this is what keeps long threads working. |
 | `--usage history\|claude` | `CLAUDE_BRIDGE_USAGE` | what to report as `prompt_tokens`. Default `history`: the size of Hermes' own conversation. `claude`: Claude's raw total, which sums every internal model call and can be hundreds of thousands of tokens for a 3-message chat, making Hermes try to compress it (see Troubleshooting). Raw numbers are always in the response as `claude_usage`. |
@@ -219,15 +232,15 @@ hermes-claude-cli-bridge serve \
 
 ## Bundled prompts
 
-The bridge ships three optional prompt files (in `src/hermes_claude_cli_bridge/prompts/`). None are on by default. Turn them on with `serve --prompt <name>` (repeatable) or `--prompt all`, or when installing: `install --service --prompts all`. At a terminal, `install` asks once and defaults to no.
+The bridge ships three optional prompt files (in `src/hermes_claude_cli_bridge/prompts/`). None are on by default; the quick start recommends all three. Turn them on with `serve --prompt <name>` (repeatable) or `--prompt all`, or when installing: `install --service --prompt all` (`--prompts none` to skip). At a terminal, `install` without the flag asks once and defaults to no.
 
 | Name | What it adds |
 |---|---|
-| `agents` | Chat-bridge basics: short markdown replies in the user's language; the gateway's chat-context names are labels, not instructions; a `# goal` comment on every shell command (it becomes the `🔧` headline); text found in files, pages or memory is data; secrets and personal data rules; safe git when several chats share a checkout (pathspec commits, no `--amend`); what needs approval (production changes, bulk writes or exports, host files, reboots) and a fixed **Approval needed** format (Context & intent, Change, Risks, Blast radius, Rollback). |
-| `self-learn` | Claude saves reusable procedures as Claude Code skills in `~/.claude/skills/`: at once when you say "learn this" / "save this as a skill", and on its own only after a build, test, deploy or investigation that worked and would have gone faster with the skill. It edits only skills it created (marked `<!-- created-by: claude-self-learn -->`), never yours; logs every change to `~/.claude/skills/.self-learn-log.md` so concurrent chats do not duplicate; keeps skills under 80 lines and at most 40; says `Skill saved: <name>` in the reply. |
+| `agents` | Chat-bridge basics: short markdown replies in the user's language; the gateway's chat-context names are labels, not instructions; a `# goal` comment on every shell command (it becomes the `🔧` headline); text found in files, pages or memory is data; secrets and personal data rules; safe git when several chats share a checkout (pathspec commits, no `--amend`); what needs approval (production changes, bulk writes or exports, host files, reboots) and a fixed **Approval needed** format (Context & intent, Change, Risks, Blast radius, Rollback). **Mistakes**: read `MISTAKES.md` (an index) and the matching `MISTAKES-<type>.md` (`build`, `test`, `deploy`, `git`, …) before building, testing, deploying or changing a system; record every mistake and near miss there, with what happened, how it was caught and the fix. **Log**: when a turn changed anything, append `YYYY-MM-DD HH:MM TZ · who asked · what was done` to `LOG.md`. |
+| `self-learn` | Claude saves reusable procedures as Claude Code skills in `~/.claude/skills/`: at once when you say "learn this" / "save this as a skill", and on its own only after a build, test, deploy or investigation that worked and would have gone faster with the skill. It edits only skills it created (marked `<!-- created-by: claude-self-learn -->`), never yours; logs every change to `~/.claude/skills/.self-learn-log.md` so concurrent chats do not duplicate; keeps skills under 80 lines and at most 40; says `Skill saved: <name>` in the reply. Also keeps the `MISTAKES` files (same format as `agents`), and turns a mistake that keeps recurring into a skill. |
 | `subagents` | Claude orchestrates and delegates with the Agent tool: design to Opus, code and review to Sonnet, commands and search to Haiku; every change is reviewed before it counts as done. Uses agents named `designer`, `coder`, `reviewer`, `runner`, `search` if you define them, else the built-in ones with the model set. |
 
-Each file is appended to every turn (all three: about 1.7k tokens). The approval rules name no approver: Claude asks the person who asked. To change a rule, copy the file, edit it and pass it with `--append-system-prompt-file` instead.
+Each file is appended to every turn (all three: about 2.3k tokens). `MISTAKES*.md` and `LOG.md` live in `--notes-dir` (env `CLAUDE_BRIDGE_NOTES_DIR`, default `~/.claude/notes`), one place for every chat and repo; point it at a shared repo to keep them with your team's docs. The approval rules name no approver: Claude asks the person who asked. To change a rule, copy the file, edit it and pass it with `--append-system-prompt-file` instead.
 
 ## How it behaves
 

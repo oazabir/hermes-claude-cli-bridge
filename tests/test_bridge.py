@@ -678,6 +678,33 @@ class BundledPromptTests(unittest.TestCase):
                              ["subagents.md"])
             self.assertEqual([Path(f).name for f in bridge.parse_args([]).append_system_prompt_file], ["agents.md"])
 
+    def test_notes_dir_is_filled_into_bundled_prompts_only(self):
+        default = self._prompt("--prompt", "all")
+        notes = str(Path.home() / ".claude" / "notes")
+        self.assertNotIn("{{NOTES_DIR}}", default)
+        for want in (f"Mistakes live in `{notes}`", f"{notes}/MISTAKES.md", f"{notes}/LOG.md"):
+            self.assertIn(want, default)
+        custom = self._prompt("--prompt", "agents", "--notes-dir", "/srv/team-notes")
+        self.assertIn("/srv/team-notes/LOG.md", custom)
+        self.assertNotIn(notes, custom)
+
+    def test_operator_files_are_never_rewritten(self):
+        b = Bridge("--prompt", "agents")
+        try:
+            (b.tmp / "sys.txt").write_text("keep {{NOTES_DIR}} literal")
+            b.chat("hi", "thread-literal")
+            (call,) = b.calls()
+            self.assertIn("keep {{NOTES_DIR}} literal", call[call.index("--append-system-prompt") + 1])
+        finally:
+            b.stop()
+
+    def test_mistakes_and_log_rules_are_in_agents_and_self_learn(self):
+        agents = (bridge.PROMPTS_DIR / "agents.md").read_text()
+        self.assertIn("## Mistakes", agents)
+        self.assertIn("## Log", agents)
+        self.assertIn("MISTAKES-build.md", agents)
+        self.assertIn("{{NOTES_DIR}}/MISTAKES.md", (bridge.PROMPTS_DIR / "self-learn.md").read_text())
+
     def test_unknown_prompt_name_stops_startup(self):
         err = io.StringIO()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):

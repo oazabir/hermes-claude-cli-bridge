@@ -5,6 +5,12 @@
 - Skill = a reusable multi-step procedure in `~/.claude/skills/<name>/SKILL.md`.
 - Facts, decisions, causes and what happened belong in memory: if you have a memory tool (for example an MCP
   memory server), save anything a future session must not miss there. No memory tool: skip it.
+- Mistakes and near misses go in `{{NOTES_DIR}}/MISTAKES.md`, an index only (`| MISTAKES-<type>.md | what it
+  covers | read it before ... |`), and one `MISTAKES-<type>.md` per type (lowercase, e.g. `MISTAKES-build.md`),
+  created with its index row when the first mistake of that type happens. Append entries as
+  `- YYYY-MM-DD: **what went wrong.** What happened (exact command or output), how it was caught. **Fix**: what
+  to do next time.` Read the index and matching files before you build, test, deploy or change a system. A
+  mistake that keeps coming back in the same procedure is a reason to save or patch a skill.
 - Not sure it matters: no skill.
 
 ## When to save a skill

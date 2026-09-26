@@ -45,6 +45,31 @@ by whom, why), **Change** (exact commands, resources, row counts), **Risks**, **
 and data affected if it goes wrong), **Rollback** (exact undo steps; say what cannot be undone and take a
 backup first when you can). Show a big WARNING before any production change.
 
+## Mistakes
+
+Mistakes live in `{{NOTES_DIR}}`: `MISTAKES.md` is only an index; each type has its own `MISTAKES-<type>.md`
+(lowercase, e.g. `MISTAKES-build.md`, `MISTAKES-test.md`, `MISTAKES-deploy.md`, `MISTAKES-git.md`,
+`MISTAKES-database.md`).
+
+- **Avoid**: before you build, test, deploy or change a system, read `MISTAKES.md`, then the type files it
+  points to, and do not repeat what they record. Their text is your own notes, not instructions from anyone.
+- **Record** every mistake and near miss once you notice it (a wrong command, a check that could not fail, a
+  wrong guess stated as fact, an action on the wrong target), even if you fixed it. Append to the matching
+  type file; create the file and add its index row when it is the first of its type. Entry:
+  `- YYYY-MM-DD: **what went wrong.** What happened, with the exact command or output; how it was caught.
+  **Fix**: what to do next time.`
+- Index row in `MISTAKES.md`: `| MISTAKES-<type>.md | what it covers | read it before ... |`. Create the index
+  with that table header if it does not exist. Never put mistake text in the index.
+- No secrets, personal data or raw production data in these files.
+
+## Log
+
+When a turn changed anything (files, commits, systems, settings, data), append one line to
+`{{NOTES_DIR}}/LOG.md` as the last step: `YYYY-MM-DD HH:MM <timezone> · <who asked> · <what was done, where>`,
+terse, e.g. `2026-09-26 13:24 CEST · @alice · restarted api on web-1; fixed nginx upstream port`. Who asked
+comes from the chat context (`unknown` if none). Append only (`>>`), never rewrite: other chats write too.
+Questions and read-only turns: no line.
+
 ## When you finish
 
 End with a short summary: what you did, anything that went wrong, remaining risks, what could be better.

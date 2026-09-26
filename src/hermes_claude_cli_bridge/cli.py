@@ -295,7 +295,7 @@ def _install_parser(prog: str, service_flags: bool) -> argparse.ArgumentParser:
     ap.add_argument("--os", choices=["linux", "macos"], help="service flavour (default: auto-detect)")
     ap.add_argument("--command", help=f"absolute path of the {DIST} executable the service should run (default: auto)")
     if service_flags:
-        ap.add_argument("--prompts", metavar="NAMES",
+        ap.add_argument("--prompts", "--prompt", dest="prompts", metavar="NAMES",
                         help="bundled prompt files to enable: comma list of agents, self-learn, subagents, or all / none "
                              "(default: ask when run in a terminal, else none)")
         ap.add_argument("--service", action="store_true", help="also install and start a background service (systemd user unit / launchd agent)")
