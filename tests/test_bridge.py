@@ -623,6 +623,26 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("claude turn stopped: hit the 2s turn limit", text)
         self.assertLess(took, 15)
 
+    def test_an_answer_survives_a_stop_while_background_work_lingers(self):
+        text, took = self._run("--timeout", "2", "--idle-timeout", "0", prompt="bg", FAKE_CLAUDE_LINGER="30")
+        self.assertNotIn("claude-bridge error", text)
+        self.assertIn("reply[new] bg", text)
+        self.assertIn("background work was stopped after this reply: hit the 2s turn limit", text)
+        self.assertLess(took, 15)
+
+    def test_narration_before_the_next_tool_call_is_not_an_answer(self):
+        text, _ = self._run("--timeout", "2", "--idle-timeout", "0", prompt="bg", FAKE_CLAUDE_LINGER="30",
+                            FAKE_CLAUDE_LINGER_MID="1")
+        self.assertIn("claude turn stopped: hit the 2s turn limit", text)
+        self.assertNotIn("background work was stopped", text)
+
+    def test_a_stop_mid_answer_is_still_an_error(self):
+        text, _ = self._run("--timeout", "2", "--idle-timeout", "0", prompt="PREAMBLE USE_TOOL",
+                            FAKE_CLAUDE_TOOL_SECONDS="30", FAKE_CLAUDE_TOOL_MODE="busy")
+        self.assertIn("Checking.", text)
+        self.assertIn("claude turn stopped: hit the 2s turn limit", text)
+        self.assertNotIn("background work was stopped", text)
+
     def test_stats_line_every_interval_while_a_tool_runs(self):
         text, _ = self._run("--stats-interval", "1", "--idle-timeout", "0", FAKE_CLAUDE_TOOL_SECONDS="3.5",
                             FAKE_CLAUDE_TOOL_MODE="busy")
@@ -639,8 +659,8 @@ class WatchdogTests(unittest.TestCase):
 
 
 class BackgroundCeilingTests(unittest.TestCase):
-    """claude -p waits only 10 min (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS) for background subagents after the main
-    turn ends, then interrupts them and exits. The bridge makes that ceiling its own --timeout instead."""
+    """After answering, claude -p keeps running for background work up to CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, and
+    the thread is busy all that time. The bridge sets it from --bg-wait, never above --timeout."""
 
     def _ceiling(self, *args, **env):
         b = Bridge(*args, **env)
@@ -650,12 +670,14 @@ class BackgroundCeilingTests(unittest.TestCase):
         finally:
             b.stop()
 
-    def test_ceiling_follows_the_turn_limit(self):
+    def test_ceiling_follows_bg_wait_within_the_turn_limit(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"}
         with unittest.mock.patch.dict(os.environ, env, clear=True):
-            self.assertEqual(self._ceiling(), "1800000")
-            self.assertEqual(self._ceiling("--timeout", "900"), "900000")
-            self.assertEqual(self._ceiling("--timeout", "0"), "0", "no cap: wait for background work indefinitely")
+            self.assertEqual(self._ceiling(), "600000")
+            self.assertEqual(self._ceiling("--bg-wait", "1200"), "1200000")
+            self.assertEqual(self._ceiling("--bg-wait", "900", "--timeout", "300"), "300000", "never past the hard cap")
+            self.assertEqual(self._ceiling("--bg-wait", "0", "--timeout", "900"), "900000", "0: up to --timeout")
+            self.assertEqual(self._ceiling("--bg-wait", "0", "--timeout", "0"), "0", "no cap: wait indefinitely")
 
     def test_an_operator_setting_wins(self):
         self.assertEqual(self._ceiling(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="12345"), "12345")

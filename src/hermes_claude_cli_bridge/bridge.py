@@ -487,13 +487,16 @@ def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None
 
 
 def claude_env() -> dict:
-    """claude's environment. After the main turn ends, `claude -p` waits for background subagents only up to
-    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (10 min by default), then interrupts them and exits, so a chat that asked
-    for long background work lost it at 10 minutes. The bridge's own --timeout (plus the idle watchdog) is the
-    limit that should apply; 0 = no cap. An operator's own setting wins."""
+    """claude's environment. After the main turn has answered, `claude -p` keeps running while background work
+    (subagents, background Bash, wakeups) is unfinished, for up to CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, then
+    interrupts it and exits. All that time the thread stays locked, so the chat cannot take a new message.
+    --bg-wait sets that ceiling (0 = up to --timeout); an operator's own CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS wins."""
     env = dict(os.environ)
     cap = getattr(CFG, "timeout", 0) or 0
-    env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", str(int(cap * 1000)) if cap > 0 else "0")
+    wait = getattr(CFG, "bg_wait", 0) or 0
+    if cap > 0:
+        wait = min(wait, cap) if wait > 0 else cap
+    env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", str(int(wait * 1000)))
     return env
 
 
@@ -608,6 +611,12 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     monitor.start()
     result = None
     seen_tools: set[str] = set()
+    # The main thread's own reply, for a turn that is stopped after it answered (claude -p lingering on background
+    # work): `pending` are its unanswered tool calls, `reply` its text since its last tool call, `ended` whether the
+    # model then ended its turn (stop_reason end_turn) -- text between two tool calls is narration, not an answer.
+    pending: set[str] = set()
+    reply: list[str] = []
+    ended = [False]
     try:
         for line in proc.stdout:
             try:
@@ -619,8 +628,16 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
                 live["event"] = now
             if kind == "stream_event":
                 d = (ev.get("event") or {}).get("delta") or {}
+                if not ev.get("parent_tool_use_id"):
+                    etype = (ev.get("event") or {}).get("type")
+                    if etype == "message_delta":
+                        ended[0] = d.get("stop_reason") == "end_turn"
+                    elif etype in ("message_start", "content_block_start"):
+                        ended[0] = False
                 if d.get("type") == "text_delta" and d.get("text"):
                     live["text"] = now
+                    if not ev.get("parent_tool_use_id"):
+                        reply.append(d["text"])
                     on_text(d["text"])
                 elif d.get("type") == "thinking_delta" and d.get("thinking") and on_reasoning:
                     on_reasoning(d["thinking"])
@@ -628,6 +645,9 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
                 for blk in (ev.get("message") or {}).get("content") or []:
                     if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id") not in seen_tools:
                         seen_tools.add(blk.get("id"))
+                        if not ev.get("parent_tool_use_id"):
+                            pending.add(blk.get("id"))
+                            reply.clear()
                         live["tools"][blk.get("id")] = (blk.get("name", "?"), now)
                         if on_tool:
                             on_tool(tool_headline(blk.get("name", "?"), blk.get("input")), bool(ev.get("parent_tool_use_id")))
@@ -635,6 +655,7 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
                 for blk in (ev.get("message") or {}).get("content") or []:
                     if isinstance(blk, dict) and blk.get("type") == "tool_result":
                         live["tools"].pop(blk.get("tool_use_id"), None)
+                        pending.discard(blk.get("tool_use_id"))
             elif kind == "result":
                 result = ev
         proc.wait()
@@ -652,7 +673,14 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     if abandoned:
         raise ClientGone("caller disconnected; claude was stopped")
     if stopped:
-        raise RuntimeError(f"claude turn stopped: {stopped[0]}")
+        if result is None and ended[0] and not pending and "".join(reply).strip():
+            result = {"type": "result", "is_error": False, "result": "".join(reply), "usage": {}}
+        if result is None or result.get("is_error"):
+            raise RuntimeError(f"claude turn stopped: {stopped[0]}")
+        # claude had already answered and was only waiting on background work: keep the answer, say what was cut
+        note = f"\n\n_(background work was stopped after this reply: {stopped[0]})_"
+        on_text(note)
+        result = {**result, "result": (result.get("result") or "") + note}
     return result, "".join(stderr_buf)
 
 
@@ -1033,8 +1061,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--cwd", default=env("CLAUDE_BRIDGE_CWD", str(HERMES_HOME / "claude-bridge" / "workspace")),
                     help="working dir for claude; sessions are stored per-cwd so keep it stable")
     ap.add_argument("--state-file", default=env("CLAUDE_BRIDGE_STATE", str(HERMES_HOME / "claude-bridge" / "sessions.json")))
-    ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "1800")),
-                    help="hard cap on one Claude turn, busy or not (default 1800, Hermes' own gateway_timeout; 0 = none)")
+    ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "7200")),
+                    help="hard cap on one Claude turn, busy or not (default 7200; 0 = none). Hermes' gateway_timeout "
+                         "is an inactivity limit and the stats line keeps it alive, so this is the only wall-clock cap")
+    ap.add_argument("--bg-wait", type=float, default=float(env("CLAUDE_BRIDGE_BG_WAIT", "600")),
+                    help="after claude has answered, how long it may keep running for unfinished background work "
+                         "(subagents, background Bash) before claude stops it; the thread is busy meanwhile "
+                         "(default 600; 0 = up to --timeout)")
     ap.add_argument("--idle-timeout", type=float, default=float(env("CLAUDE_BRIDGE_IDLE_TIMEOUT", "600")),
                     help="stop a turn after this long with nothing happening: no stream output from claude while no tool "
                          "runs, or no CPU/I/O by claude's child processes while one does (default 600; 0 = off)")
@@ -1091,7 +1124,7 @@ def main(argv=None):
           f"effort={CFG.effort or 'default'} autocompact={CFG.autocompact or 'default'} "
           f"prompt_files={CFG.append_system_prompt_file or '-'} ttl_days={CFG.session_ttl_days or 'off'} "
           f"max_concurrency={CFG.max_concurrency} client_check={CFG.client_check_interval or 'off'}s "
-          f"timeout={CFG.timeout or 'off'}s idle={CFG.idle_timeout or 'off'}s stats={CFG.stats_interval or 'off'}s "
+          f"timeout={CFG.timeout or 'off'}s bg_wait={CFG.bg_wait or 'timeout'}s idle={CFG.idle_timeout or 'off'}s stats={CFG.stats_interval or 'off'}s "
           f"auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
     try:
         srv.serve_forever()

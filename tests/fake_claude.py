@@ -11,7 +11,8 @@ USE_TOOL it also emits a Bash tool call first
 (after a 'Checking.' text block if it contains PREAMBLE; the tool takes $FAKE_CLAUDE_TOOL_SECONDS, runs as a child
 process per $FAKE_CLAUDE_TOOL_MODE busy|silent, and emits a heartbeat every $FAKE_CLAUDE_HEARTBEAT seconds). Every invocation is appended to $FAKE_CLAUDE_LOG (JSON lines).
 Known sessions live in $FAKE_CLAUDE_STATE (a JSON list).
-Set FAKE_CLAUDE_SLEEP to make a run hang, and FAKE_CLAUDE_SPAWN_CHILD=1 to leave a grandchild holding stdout
+Set FAKE_CLAUDE_LINGER to keep running (busy) for that many seconds after the answer text and before the result,
+FAKE_CLAUDE_SLEEP to make a run hang, and FAKE_CLAUDE_SPAWN_CHILD=1 to leave a grandchild holding stdout
 (the case that used to wedge the bridge's read loop past its timeout).
 """
 import json
@@ -110,4 +111,11 @@ text = f"reply[{mode}] {prompt}"
 half = len(text) // 2
 for piece in (text[:half], text[half:]):
     out({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": piece}}})
+if os.environ.get("FAKE_CLAUDE_LINGER"):  # answered, then keeps running for background work, like claude -p
+    import time
+    if os.environ.get("FAKE_CLAUDE_LINGER_MID") != "1":  # MID: stopped between narration and the next tool call
+        out({"type": "stream_event", "event": {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}})
+    end = time.time() + float(os.environ["FAKE_CLAUDE_LINGER"])
+    while time.time() < end:
+        sum(range(10000))
 out({"type": "result", "is_error": False, "result": text, "usage": {"input_tokens": 3, "cache_read_input_tokens": 700000, "cache_creation_input_tokens": 0, "output_tokens": 5}})
