@@ -328,6 +328,138 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+_PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+
+def _proc_children(pid: int) -> list[int]:
+    kids: list[int] = []
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return kids
+    for tid in tasks:
+        try:
+            kids += [int(k) for k in Path(f"/proc/{pid}/task/{tid}/children").read_text().split()]
+        except (OSError, ValueError):
+            pass
+    return kids
+
+
+def _proc_entry(pid: int):
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None  # already gone
+    f = raw[raw.rindex(")") + 2:].split()  # the command name may contain spaces and parens
+    try:
+        io = dict(l.split(": ", 1) for l in Path(f"/proc/{pid}/io").read_text().splitlines())
+        r, w = int(io["rchar"]), int(io["wchar"])
+    except (OSError, KeyError, ValueError):
+        r = w = None  # another user's process (sudo): its I/O is not ours to read
+    return (pid, f[19]), {"pid": pid, "cpu": (int(f[11]) + int(f[12])) / _CLK_TCK, "rss": int(f[21]) * _PAGE, "r": r, "w": w}
+
+
+def _ps_seconds(t: str) -> float:
+    """ps TIME, e.g. 0:01.50, 01:02:03, 2-00:00:01."""
+    days, _, t = t.rpartition("-")
+    secs = 0.0
+    for part in t.split(":"):
+        secs = secs * 60 + float(part)
+    return secs + int(days or 0) * 86400
+
+
+def sample_tree(pid: int) -> dict | None:
+    """CPU seconds, RSS and bytes read/written of `pid` and every process under it, keyed (pid, start time) so a
+    reused pid is never taken for the same process. Linux reads /proc; elsewhere `ps` (CPU and RSS, no I/O).
+    None when neither works."""
+    out: dict = {}
+    if os.path.isdir("/proc/self/task"):
+        todo = [pid]
+        while todo:
+            e = _proc_entry(todo.pop())
+            if e:
+                out[e[0]] = e[1]
+                todo += _proc_children(e[1]["pid"])
+        return out
+    try:
+        ps = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss=,time="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows, kids = {}, {}
+    for line in ps.splitlines():
+        try:
+            p, pp, rss, t = line.split()
+            rows[int(p)] = {"pid": int(p), "cpu": _ps_seconds(t), "rss": int(rss) * 1024, "r": None, "w": None}
+            kids.setdefault(int(pp), []).append(int(p))
+        except ValueError:
+            continue
+    todo = [pid]
+    while todo:
+        p = todo.pop()
+        if p in rows:
+            out[(p, None)] = rows[p]
+            todo += kids.get(p, [])
+    return out
+
+
+def tree_usage(prev: dict, cur: dict, root: int) -> dict:
+    """What changed between two sample_tree() snapshots: claude itself (root) vs everything it spawned (tools,
+    MCP servers). `active` is any sign of life below claude: a new or finished process, CPU, or I/O."""
+    u = {"claude_cpu": 0.0, "claude_rss": 0, "procs": 0, "cpu": 0.0, "read": 0, "written": 0, "rss": 0,
+         "io": False, "active": False}
+    for key, s in cur.items():
+        was = prev.get(key) or {"cpu": 0.0, "r": 0, "w": 0}
+        if s["pid"] == root:
+            u["claude_cpu"] += s["cpu"] - was["cpu"]
+            u["claude_rss"] = s["rss"]
+            continue
+        d = [s["cpu"] - was["cpu"], 0, 0]
+        if s["r"] is not None:
+            u["io"] = True
+            d[1], d[2] = s["r"] - (was["r"] or 0), s["w"] - (was["w"] or 0)
+        u["procs"] += 1
+        u["rss"] += s["rss"]
+        u["cpu"] += d[0]
+        u["read"] += d[1]
+        u["written"] += d[2]
+        if key not in prev or any(x > 0 for x in d):
+            u["active"] = True
+    if any(k not in cur and v["pid"] != root for k, v in prev.items()):
+        u["active"] = True
+    return u
+
+
+def _dur(s: float) -> str:
+    s = int(s)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def _size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") or n >= 100 else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
+
+
+def stats_line(elapsed: float, interval: float, u: dict | None, running: list, quiet: float) -> str:
+    """One progress line, e.g. '📊 3m10s · last 1m: claude cpu 0.4s, 300 MB · tools (2 procs) cpu 41.2s, read
+    12.0 MB, wrote 1.5 MB, 800 MB · running Bash 2m10s · no output 2m10s'. CPU and I/O are over the interval;
+    memory is resident now. Tool names only: no paths, so nothing for the chat gateway to auto-attach."""
+    parts = [f"📊 {_dur(elapsed)}"]
+    if u is not None:
+        parts.append(f"last {_dur(interval).replace('m00s', 'm')}: claude cpu {u['claude_cpu']:.1f}s, {_size(u['claude_rss'])}")
+        if u["procs"]:
+            io = f", read {_size(u['read'])}, wrote {_size(u['written'])}" if u["io"] else ""
+            parts.append(f"tools ({u['procs']} proc{'s' if u['procs'] != 1 else ''}) cpu {u['cpu']:.1f}s{io}, {_size(u['rss'])}")
+    if running:
+        parts.append("running " + ", ".join(f"{name} {_dur(secs)}" for name, secs in running))
+    if quiet >= 60:
+        parts.append(f"no output {_dur(quiet)}")
+    return " · ".join(parts)
+
+
 def client_is_gone(conn) -> bool:
     """True once the caller has closed its end. A half-closed socket reads as readable-with-no-bytes;
     real pipelined data is left untouched by MSG_PEEK."""
@@ -341,18 +473,21 @@ def client_is_gone(conn) -> bool:
         return True  # socket already torn down
 
 
-def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None):
-    """Run one claude turn. Returns (result_event, stderr_text). Streams via on_text; on_tool(headline, is_subagent).
-    Waits for a concurrency slot first, so a burst of Hermes threads cannot fork unbounded claude processes."""
+def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None,
+               on_stats=None):
+    """Run one claude turn. Returns (result_event, stderr_text). Streams via on_text; on_tool(headline, is_subagent);
+    on_stats(line) every --stats-interval. Waits for a concurrency slot first, so a burst of Hermes threads cannot
+    fork unbounded claude processes."""
     if not _slots.acquire(timeout=getattr(CFG, "queue_timeout", 120)):
         raise Busy(f"bridge is at capacity ({CFG.max_concurrency} concurrent turns); try again shortly")
     try:
-        return _run_claude(cmd, prompt, cwd, on_text, on_reasoning, on_tool, client_gone)
+        return _run_claude(cmd, prompt, cwd, on_text, on_reasoning, on_tool, client_gone, on_stats)
     finally:
         _slots.release()
 
 
-def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None):
+def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None,
+                on_stats=None):
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
@@ -371,8 +506,6 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     stderr_buf: list[str] = []
     reader = threading.Thread(target=lambda: stderr_buf.append(proc.stderr.read() or ""), daemon=True)
     reader.start()
-    timer = threading.Timer(CFG.timeout, _kill_tree, args=(proc,))
-    timer.start()
     # A dead client is otherwise only noticed when we next write to it, and a turn can be silent for
     # minutes during one long tool call. Hermes' busy_input_mode=interrupt aborts the request exactly
     # like that, so without this poll the abandoned claude keeps running and keeps the session lock.
@@ -394,6 +527,74 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     if client_gone is not None and interval and interval > 0:
         watcher = threading.Thread(target=_watch_client, daemon=True)
         watcher.start()
+
+    # What the read loop has seen, for the monitor. `event`: last stream event that shows claude working --
+    # claude's tool_progress heartbeats only show it is alive, so they do not count. `tools`: tool calls
+    # started and not yet answered, {id: (name, started)}.
+    t0 = time.monotonic()
+    live = {"event": t0, "text": 0.0, "tools": {}}
+    stopped: list[str] = []
+
+    def _sample():
+        try:
+            return sample_tree(proc.pid)
+        except Exception as e:  # odd /proc content must never take the hard cap down with it
+            print(f"[bridge] process sampling failed: {e!r}", file=sys.stderr)
+            return None
+
+    def _monitor():
+        """Stop the turn when nothing is happening, not after a fixed time: after --idle-timeout with no stream
+        output from claude and no sign of life in the processes it spawned (a new or finished process, CPU, I/O),
+        so a busy build, rsync or background job runs on and a hung command does not. While a non-Bash tool runs
+        (a subagent, a web fetch) claude does that work itself, so its own CPU counts too. Claude's tool
+        heartbeats never count. --timeout is the hard cap either way. Also posts the stats line."""
+        cap, idle = CFG.timeout, getattr(CFG, "idle_timeout", 0) or 0
+        every = (getattr(CFG, "stats_interval", 0) or 0) if on_stats else 0
+        poll = max(0.2, min([5.0] + [x / 4 for x in (cap, idle, every) if x and x > 0]))
+        prev = last = _sample()  # prev: last poll; last: last stats line
+        below = t0  # last sign of life in the process tree
+        due = t0 + every
+        while not stop_watch.wait(poll):
+            now = time.monotonic()
+            tools = dict(live["tools"])
+            cur = _sample() if prev is not None else None
+            if cur is not None:
+                try:
+                    u = tree_usage(prev, cur, proc.pid)
+                    if u["active"] or (u["claude_cpu"] > 0.1 * poll and any(n != "Bash" for n, _ in tools.values())):
+                        below = now
+                except Exception as e:
+                    print(f"[bridge] process sampling failed: {e!r}", file=sys.stderr)
+                    cur = None
+            reason = None
+            if cap and now - t0 >= cap:
+                reason = f"hit the {cap:g}s turn limit"
+            elif idle and now - max(live["event"], below) >= idle:
+                if tools:
+                    names = ", ".join(dict.fromkeys(tool_headline(n, {}) for n, _ in tools.values()))
+                    reason = f"{names} idle for {idle:g}s (no CPU or I/O)"
+                else:
+                    reason = f"no output from claude for {idle:g}s"
+            if reason:
+                stopped.append(reason)
+                print(f"[bridge] stopping claude pid {proc.pid} after {now - t0:.0f}s: {reason}", file=sys.stderr)
+                _kill_tree(proc)
+                return
+            if every and now >= due:
+                while due <= now:
+                    due += every
+                if now - live["text"] >= min(10.0, every):  # never split text claude is streaming right now
+                    running = [(tool_headline(n, {}), now - t) for n, t in tools.values()]
+                    try:
+                        on_stats(stats_line(now - t0, every, tree_usage(last or {}, cur, proc.pid) if cur is not None else None,
+                                            running, now - live["event"]))
+                    except Exception:
+                        pass  # the reply stream is gone (the client watcher deals with that), or odd /proc data
+                    last = cur
+            prev = cur if cur is not None else prev
+
+    monitor = threading.Thread(target=_monitor, daemon=True)
+    monitor.start()
     result = None
     seen_tools: set[str] = set()
     try:
@@ -402,33 +603,45 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
                 ev = json.loads(line)
             except ValueError:
                 continue
-            if ev.get("type") == "stream_event":
+            kind, now = ev.get("type"), time.monotonic()
+            if not (kind == "tool_progress" and ev.get("heartbeat")):
+                live["event"] = now
+            if kind == "stream_event":
                 d = (ev.get("event") or {}).get("delta") or {}
                 if d.get("type") == "text_delta" and d.get("text"):
+                    live["text"] = now
                     on_text(d["text"])
                 elif d.get("type") == "thinking_delta" and d.get("thinking") and on_reasoning:
                     on_reasoning(d["thinking"])
-            elif ev.get("type") == "assistant" and on_tool:
+            elif kind == "assistant":
                 for blk in (ev.get("message") or {}).get("content") or []:
                     if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id") not in seen_tools:
                         seen_tools.add(blk.get("id"))
-                        on_tool(tool_headline(blk.get("name", "?"), blk.get("input")), bool(ev.get("parent_tool_use_id")))
-            elif ev.get("type") == "result":
+                        live["tools"][blk.get("id")] = (blk.get("name", "?"), now)
+                        if on_tool:
+                            on_tool(tool_headline(blk.get("name", "?"), blk.get("input")), bool(ev.get("parent_tool_use_id")))
+            elif kind == "user":
+                for blk in (ev.get("message") or {}).get("content") or []:
+                    if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                        live["tools"].pop(blk.get("tool_use_id"), None)
+            elif kind == "result":
                 result = ev
         proc.wait()
     except BaseException:
         _kill_tree(proc)  # client went away
         raise
     finally:
-        timer.cancel()
         stop_watch.set()
         if watcher is not None:
             watcher.join(2)
+        monitor.join(10)  # a stats line in flight must land before the answer
         # the error text drives the resume/session-id self-heal below, so wait for it rather
         # than racing the reader thread and treating a lost message as "no error"
         reader.join(5)
     if abandoned:
         raise ClientGone("caller disconnected; claude was stopped")
+    if stopped:
+        raise RuntimeError(f"claude turn stopped: {stopped[0]}")
     return result, "".join(stderr_buf)
 
 
@@ -453,7 +666,7 @@ def _read_prompt_file(path: str) -> str:
     return text
 
 
-def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None):
+def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None, on_stats=None):
     """Run a chat turn with session bookkeeping. Returns (result, session_uuid)."""
     messages = body.get("messages") or []
     ext = body.get("claude_bridge") or {}
@@ -480,7 +693,7 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None)
     if not hsid:  # no thread identity -> one-shot, nothing persisted
         sid = str(uuid.uuid4())
         res, err = run_claude(build_cmd(model=model, session=sid, resume=False, opts=opts, persist=False),
-                              transcript(messages), cwd, on_text, on_reasoning, on_tool, client_gone)
+                              transcript(messages), cwd, on_text, on_reasoning, on_tool, client_gone, on_stats)
         return _check(res, err), None
 
     sid = session_uuid(hsid)
@@ -500,7 +713,7 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None)
             res, err = run_claude(
                 build_cmd(model=model, session=sid, resume=resume, opts=opts, persist=True),
                 prompt, state.get(sid, {}).get("cwd", cwd),
-                lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool, client_gone)
+                lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool, client_gone, on_stats)
             failed = res is None or res.get("is_error")
             blob = (err + json.dumps(res or {})).lower()
             if failed and not streamed and attempt == 0:
@@ -637,6 +850,7 @@ class Handler(BaseHTTPRequestHandler):
         except Busy as e:
             return self._json(429, {"error": {"message": str(e), "type": "claude_bridge_busy"}})
         except Exception as e:
+            print(f"[bridge] turn failed: {e}", file=sys.stderr)
             return self._json(502, {"error": {"message": str(e), "type": "claude_bridge_error"}})
         text = res.get("result") or "".join(parts)
         self._json(200, {
@@ -675,6 +889,7 @@ class Handler(BaseHTTPRequestHandler):
             last = [None]  # "text" | "tool": kind of the previous event
             fresh = [False]  # output since the last FLUSH_TICK
             done = threading.Event()
+            emit = threading.RLock()  # the stats line comes from another thread; keep run markers and newlines consistent
 
             def switch_to(kind):
                 fresh[0] = True
@@ -697,22 +912,34 @@ class Handler(BaseHTTPRequestHandler):
                 tick.start()
 
             def on_text(t):
-                switch_to("text")
-                sent.append(t)
-                line_start[0] = t.endswith("\n")
-                self._sse(chunk({"content": t}))
+                with emit:
+                    switch_to("text")
+                    sent.append(t)
+                    line_start[0] = t.endswith("\n")
+                    self._sse(chunk({"content": t}))
 
             def on_tool(headline, sub):
-                switch_to("tool")
-                if CFG.tool_events == "reasoning":
-                    self._sse(chunk({"reasoning_content": f"🔧 {headline}\n"}))
-                elif CFG.tool_events == "content":
-                    self._sse(chunk({"content": ("" if line_start[0] else "\n") + ("  ↳ " if sub else "") + f"🔧 {headline}\n"}))
-                    line_start[0] = True
+                with emit:
+                    switch_to("tool")
+                    if CFG.tool_events == "reasoning":
+                        self._sse(chunk({"reasoning_content": f"🔧 {headline}\n"}))
+                    elif CFG.tool_events == "content":
+                        self._sse(chunk({"content": ("" if line_start[0] else "\n") + ("  ↳ " if sub else "") + f"🔧 {headline}\n"}))
+                        line_start[0] = True
+
+            def on_stats(line):
+                with emit:
+                    switch_to("tool")  # counts as progress, so the flush ticker posts it on Mattermost
+                    if CFG.tool_events == "reasoning":
+                        self._sse(chunk({"reasoning_content": line + "\n"}))
+                    else:
+                        self._sse(chunk({"content": ("" if line_start[0] else "\n") + line + "\n"}))
+                        line_start[0] = True
 
             try:
                 res, sid = turn(body, on_text, lambda t: self._sse(chunk({"reasoning_content": t})),
-                                on_tool if CFG.tool_events != "off" or segments else None, client_gone=self._client_gone)
+                                on_tool if CFG.tool_events != "off" or segments else None, client_gone=self._client_gone,
+                                on_stats=on_stats if CFG.tool_events != "off" else None)
             finally:
                 done.set()
                 if tick.is_alive():
@@ -728,6 +955,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 return
         except Exception as e:
+            print(f"[bridge] turn failed: {e}", file=sys.stderr)
             try:
                 self._sse(chunk({"content": f"\n[claude-bridge error: {e}]"}, "stop"))
             except OSError:
@@ -769,7 +997,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--cwd", default=env("CLAUDE_BRIDGE_CWD", str(HERMES_HOME / "claude-bridge" / "workspace")),
                     help="working dir for claude; sessions are stored per-cwd so keep it stable")
     ap.add_argument("--state-file", default=env("CLAUDE_BRIDGE_STATE", str(HERMES_HOME / "claude-bridge" / "sessions.json")))
-    ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "900")))
+    ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "1800")),
+                    help="hard cap on one Claude turn, busy or not (default 1800, Hermes' own gateway_timeout; 0 = none)")
+    ap.add_argument("--idle-timeout", type=float, default=float(env("CLAUDE_BRIDGE_IDLE_TIMEOUT", "600")),
+                    help="stop a turn after this long with nothing happening: no stream output from claude while no tool "
+                         "runs, or no CPU/I/O by claude's child processes while one does (default 600; 0 = off)")
+    ap.add_argument("--stats-interval", type=float, default=float(env("CLAUDE_BRIDGE_STATS_INTERVAL", "60")),
+                    help="post a CPU / memory / I/O line for claude and its tool processes every N seconds of a turn, "
+                         "alongside the tool headlines (default 60; 0 = off)")
     ap.add_argument("--session-ttl-days", type=float, default=float(env("CLAUDE_BRIDGE_SESSION_TTL_DAYS", "7")),
                     help="forget a thread after this many days without a message, and delete Claude Code's own "
                          "transcript for it (default 7; 0 disables housekeeping and keeps every session forever)")
@@ -815,6 +1050,7 @@ def main(argv=None):
           f"effort={CFG.effort or 'default'} autocompact={CFG.autocompact or 'default'} "
           f"prompt_files={CFG.append_system_prompt_file or '-'} ttl_days={CFG.session_ttl_days or 'off'} "
           f"max_concurrency={CFG.max_concurrency} client_check={CFG.client_check_interval or 'off'}s "
+          f"timeout={CFG.timeout or 'off'}s idle={CFG.idle_timeout or 'off'}s stats={CFG.stats_interval or 'off'}s "
           f"auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
     try:
         srv.serve_forever()

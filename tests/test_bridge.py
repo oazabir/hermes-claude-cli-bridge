@@ -573,7 +573,98 @@ class HardeningTests(unittest.TestCase):
             b.stop()
 
 
+class WatchdogTests(unittest.TestCase):
+    """A turn is stopped when nothing is happening, not after a fixed time: silence from claude itself, or a
+    running tool whose processes use no CPU and do no I/O. Claude's tool heartbeats prove only that claude is
+    alive, so they never count. A busy tool may run past the idle limit; --timeout stays as the hard cap."""
+
+    def _run(self, *args, prompt="USE_TOOL", **env):
+        b = Bridge(*args, **env)
+        try:
+            payload = {"model": "sonnet", "stream": True, "claude_bridge": {"session_id": "thread-wd", "segments": True},
+                       "messages": [{"role": "user", "content": prompt}]}
+            started = time.time()
+            raw = b.raw_post(json.dumps(payload).encode(), {"content-type": "application/json"}, 60).read().decode()
+            text = "".join(json.loads(l[6:])["choices"][0]["delta"].get("content") or "" for l in raw.splitlines()
+                           if l.startswith("data: ") and l != "data: [DONE]")
+            return bridge.MARKERS.sub("", text), time.time() - started
+        finally:
+            b.stop()
+
+    def test_silent_claude_is_stopped_after_the_idle_timeout(self):
+        text, took = self._run("--idle-timeout", "2", "--timeout", "60", prompt="hang", FAKE_CLAUDE_SLEEP="60")
+        self.assertIn("claude turn stopped: no output from claude for 2s", text)
+        self.assertLess(took, 15)
+
+    def test_a_busy_tool_outlives_the_idle_timeout(self):
+        text, _ = self._run("--idle-timeout", "1.5", "--timeout", "60", FAKE_CLAUDE_TOOL_SECONDS="5",
+                            FAKE_CLAUDE_TOOL_MODE="busy", FAKE_CLAUDE_HEARTBEAT="0.5")
+        self.assertNotIn("claude-bridge error", text)
+        self.assertIn("reply[", text)
+
+    def test_a_silent_tool_is_stopped_even_while_claude_sends_heartbeats(self):
+        text, took = self._run("--idle-timeout", "1.5", "--timeout", "60", FAKE_CLAUDE_TOOL_SECONDS="30",
+                               FAKE_CLAUDE_TOOL_MODE="silent", FAKE_CLAUDE_HEARTBEAT="0.5")
+        self.assertIn("claude turn stopped: Bash idle for 1.5s (no CPU or I/O)", text)
+        self.assertNotIn("reply[", text)
+        self.assertLess(took, 15)
+
+    def test_a_busy_background_job_counts_as_activity(self):
+        text, _ = self._run("--idle-timeout", "1.5", "--timeout", "60", prompt="bg", FAKE_CLAUDE_BG_SECONDS="5")
+        self.assertNotIn("claude-bridge error", text)
+        self.assertIn("reply[", text)
+
+    def test_the_hard_cap_names_the_limit(self):
+        text, took = self._run("--timeout", "2", "--idle-timeout", "0", FAKE_CLAUDE_TOOL_SECONDS="30",
+                               FAKE_CLAUDE_TOOL_MODE="busy")
+        self.assertIn("claude turn stopped: hit the 2s turn limit", text)
+        self.assertLess(took, 15)
+
+    def test_stats_line_every_interval_while_a_tool_runs(self):
+        text, _ = self._run("--stats-interval", "1", "--idle-timeout", "0", FAKE_CLAUDE_TOOL_SECONDS="3.5",
+                            FAKE_CLAUDE_TOOL_MODE="busy")
+        stats = [l for l in text.splitlines() if l.startswith("📊")]
+        self.assertGreaterEqual(len(stats), 2, text)
+        self.assertIn("claude cpu", stats[-1])
+        self.assertIn("tools (1 proc) cpu", stats[-1])
+        self.assertIn("running Bash", stats[-1])
+        self.assertIn("reply[", text)
+
+    def test_no_stats_when_disabled(self):
+        text, _ = self._run("--stats-interval", "0", FAKE_CLAUDE_TOOL_SECONDS="2.5", FAKE_CLAUDE_TOOL_MODE="busy")
+        self.assertNotIn("📊", text)
+
+
 class HelperTests(unittest.TestCase):
+    def test_sample_tree_sees_this_process_and_its_children(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            time.sleep(0.3)
+            snap = bridge.sample_tree(os.getpid())
+            pids = {s["pid"] for s in snap.values()}
+            self.assertIn(os.getpid(), pids)
+            self.assertIn(child.pid, pids)
+            u = bridge.tree_usage({}, snap, os.getpid())
+            self.assertGreater(u["claude_rss"], 0)
+            self.assertGreaterEqual(u["procs"], 1)
+            self.assertTrue(u["active"], "a process that was not there before is activity")
+            self.assertFalse(bridge.tree_usage(snap, snap, os.getpid())["active"], "no change is no activity")
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_ps_time_parsing(self):
+        for raw, secs in (("0:01.50", 1.5), ("01:02:03", 3723), ("2-00:00:01", 172801), ("12:05", 725)):
+            self.assertAlmostEqual(bridge._ps_seconds(raw), secs)
+
+    def test_stats_line_format(self):
+        u = {"claude_cpu": 0.4, "claude_rss": 300 << 20, "procs": 2, "cpu": 41.25, "read": 12 << 20,
+             "written": 1536 << 10, "rss": 800 << 20, "io": True}
+        line = bridge.stats_line(190, 60, u, [("Bash", 130)], quiet=130)
+        self.assertEqual(line, "📊 3m10s · last 1m: claude cpu 0.4s, 300 MB · tools (2 procs) cpu 41.2s, "
+                               "read 12.0 MB, wrote 1.5 MB, 800 MB · running Bash 2m10s · no output 2m10s")
+        self.assertEqual(bridge.stats_line(45, 60, None, [], quiet=0), "📊 45s")
+
     def test_tool_headline(self):
         h = bridge.tool_headline
         self.assertEqual(h("Bash", {"command": "ls   -la\n/tmp"}), "Bash: `ls -la`")
