@@ -46,8 +46,10 @@ MODELS = ["sonnet", "opus", "haiku"]
 # TOOL_RUN open a run of Claude text or tool headlines; FLUSH_TICK says "post the progress so far" (sent every
 # --flush-interval seconds while the turn produces output). The plugin maps them onto Hermes' own new-message
 # and interim-message machinery. Invisible format characters, in case some other path lets one through.
-TEXT_RUN, TOOL_RUN, FLUSH_TICK = "\u2063", "\u2064", "\u2062"
-MARKERS = re.compile("[\u2062\u2063\u2064]")
+# STATUS (only when the client asked for live_status) prefixes one status line -- a tool headline or the stats
+# line -- that the plugin keeps in a single chat post it edits in place, instead of posting it as progress.
+TEXT_RUN, TOOL_RUN, FLUSH_TICK, STATUS = "\u2063", "\u2064", "\u2062", "\u2061"
+MARKERS = re.compile("[\u2061\u2062\u2063\u2064]")
 
 CFG = argparse.Namespace()  # replaced by main(); getattr(..., default) until then
 _state_lock = threading.RLock()
@@ -944,6 +946,7 @@ class Handler(BaseHTTPRequestHandler):
             line_start = [True]  # keep tool headlines on their own line
             # text -> tools -> text: each run becomes its own chat message, like Hermes' own tool loop
             segments = bool((body.get("claude_bridge") or {}).get("segments"))
+            live_status = segments and CFG.tool_events == "content" and bool((body.get("claude_bridge") or {}).get("live_status"))
             last = [None]  # "text" | "tool": kind of the previous event
             fresh = [False]  # output since the last FLUSH_TICK
             done = threading.Event()
@@ -976,7 +979,16 @@ class Handler(BaseHTTPRequestHandler):
                     line_start[0] = t.endswith("\n")
                     self._sse(chunk({"content": t}))
 
+            def status(line):
+                fresh[0] = True  # a flush tick lets the plugin push the edit
+                last[0] = None  # whatever comes next opens a run of its own
+                self._sse(chunk({"content": STATUS + line}))
+
             def on_tool(headline, sub):
+                if live_status:
+                    with emit:
+                        status(("  ↳ " if sub else "") + f"🔧 {headline}")
+                    return
                 with emit:
                     switch_to("tool")
                     if CFG.tool_events == "reasoning":
@@ -986,6 +998,10 @@ class Handler(BaseHTTPRequestHandler):
                         line_start[0] = True
 
             def on_stats(line):
+                if live_status:
+                    with emit:
+                        status(line)
+                    return
                 with emit:
                     switch_to("tool")  # counts as progress, so the flush ticker posts it on Mattermost
                     if CFG.tool_events == "reasoning":
@@ -1003,7 +1019,9 @@ class Handler(BaseHTTPRequestHandler):
                 if tick.is_alive():
                     tick.join()  # no tick may land after the answer
             if not sent and res.get("result"):
-                self._sse(chunk({"content": res["result"]}))
+                with emit:
+                    switch_to("text")  # after a status line or tool run the answer must open a text run of its own
+                    self._sse(chunk({"content": res["result"]}))
             self._sse(chunk({}, "stop", usage=_usage(res, body, raw_len), claude_usage=res.get("usage")))
         except (BrokenPipeError, ConnectionResetError, ClientGone):
             return

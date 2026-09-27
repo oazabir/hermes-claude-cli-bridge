@@ -269,7 +269,7 @@ class BridgeTests(unittest.TestCase):
 class PluginSegmentTests(unittest.TestCase):
     """The Hermes plugin maps the bridge's markers onto Hermes' own new-message / interim-message machinery."""
 
-    T, O, F = bridge.TEXT_RUN, bridge.TOOL_RUN, bridge.FLUSH_TICK
+    T, O, F, S = bridge.TEXT_RUN, bridge.TOOL_RUN, bridge.FLUSH_TICK, bridge.STATUS
 
     def setUp(self):
         import importlib.util
@@ -305,15 +305,122 @@ class PluginSegmentTests(unittest.TestCase):
         self.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.mod)
         self.AIAgent = AIAgent
-        self.assertEqual((self.mod.TEXT_RUN, self.mod.TOOL_RUN, self.mod.FLUSH_TICK), (self.T, self.O, self.F))
+        self.assertEqual((self.mod.TEXT_RUN, self.mod.TOOL_RUN, self.mod.FLUSH_TICK, self.mod.STATUS),
+                         (self.T, self.O, self.F, self.S))
         self.assertEqual(self.mod.claude_code.build_extra_body(session_id="s")["claude_bridge"],
-                         {"segments": True, "session_id": "s"})
+                         {"segments": True, "live_status": True, "session_id": "s"})
         self.mod._install_segment_breaks()  # idempotent: must not wrap twice
 
-    def run_turn(self, live, deltas):
+    def run_turn(self, live, deltas, adapter=None):
         self.deltas = deltas
         agent = self.AIAgent(live)
+        if adapter is not None:  # a gateway turn, as Hermes wires it: tool_progress_callback is its bound method
+            agent.tool_progress_callback = self.Turn(adapter).progress_callback
         return agent, agent._interruptible_streaming_api_call({}).choices[0].message.content
+
+    class Adapter:
+        def __init__(self, fail_send=False):
+            self.posts, self.fail_send, self.stale = [], fail_send, False  # posts: [[text, ...edits]]
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            import types
+            assert (chat_id, metadata) == ("chan", {"thread_id": "root"})
+            if self.fail_send:
+                return types.SimpleNamespace(success=False, message_id=None)
+            self.posts.append([content])
+            return types.SimpleNamespace(success=True, message_id=f"p{len(self.posts)}")
+
+        async def edit_message(self, chat_id, message_id, content, *, finalize=False):
+            self.posts[int(message_id[1:]) - 1].append(content)
+
+    class Turn:
+        def __init__(self, adapter):
+            import types
+            self._ctx = types.SimpleNamespace(_status_adapter=adapter, _status_chat_id="chan",
+                                              _status_thread_metadata={"thread_id": "root"},
+                                              _run_still_current=lambda: not adapter.stale)
+
+        def _schedule(self, coro, log_message):
+            import asyncio
+            import concurrent.futures
+            fut = concurrent.futures.Future()
+            fut.set_result(asyncio.run(coro))
+            return fut
+
+        def progress_callback(self, *a, **kw):
+            pass
+
+    def test_status_lines_share_one_post_that_is_edited_in_place(self):
+        self.mod.STATUS_EDIT_GAP = 0
+        ad = self.Adapter()
+        agent, content = self.run_turn(False, [
+            self.T, "Checking.", self.S, "🔧 Bash: a", self.S, "📊 1m00s · cpu 1s", self.F,
+            self.S, "  ↳ 🔧 Read: b", self.S, "📊 2m00s · cpu 2s", self.F,
+            self.T, "The answer."], adapter=ad)
+        self.assertEqual(len(ad.posts), 1, "one status post for the whole turn")
+        self.assertEqual(ad.posts[0][0], "🔧 Bash: a")
+        self.assertEqual(ad.posts[0][-1], "📊 2m00s · cpu 2s\n🔧 Bash: a\n  ↳ 🔧 Read: b", "latest stats on top")
+        self.assertFalse(any("📊" in m or "🔧" in m for m in agent.interim), agent.interim)
+        self.assertEqual(agent.interim, ["Checking."])
+        self.assertEqual(content, "The answer.")
+
+    def test_edits_are_throttled_but_the_last_state_always_lands(self):
+        self.mod.STATUS_EDIT_GAP = 3600
+        ad = self.Adapter()
+        agent, content = self.run_turn(False, [self.S, "🔧 Bash: a", self.S, "🔧 Bash: b", self.F,
+                                               self.S, "📊 1m00s", self.T, "Done."], adapter=ad)
+        self.assertEqual(ad.posts, [["🔧 Bash: a", "📊 1m00s\n🔧 Bash: a\n🔧 Bash: b"]])
+        self.assertEqual(content, "Done.")
+
+    def test_a_long_turn_drops_the_oldest_headlines_from_the_post(self):
+        self.mod.STATUS_EDIT_GAP = 0
+        ad = self.Adapter()
+        deltas = [x for i in range(300) for x in (self.S, f"🔧 Bash: step {i:03d} " + "x" * 40)]
+        self.run_turn(False, deltas + [self.S, "📊 9m00s", self.T, "Done."], adapter=ad)
+        last = ad.posts[0][-1]
+        self.assertLessEqual(len(last), 4000)
+        self.assertTrue(last.startswith("📊 9m00s\n… "), last[:40])
+        self.assertIn("step 299", last)
+        self.assertNotIn("step 000", last)
+
+    def test_a_stale_turn_stops_editing(self):
+        self.mod.STATUS_EDIT_GAP = 0
+        ad = self.Adapter()
+        deltas = [self.S, "🔧 Bash: a", self.F]
+        self.deltas = deltas
+        agent = self.AIAgent(False)
+        agent.tool_progress_callback = self.Turn(ad).progress_callback
+        orig = agent._fire_stream_delta
+
+        def fire(text):
+            orig(text)
+            if text == self.F:
+                ad.stale = True
+        agent._fire_stream_delta = fire
+        self.deltas = deltas + [self.S, "🔧 Bash: b", self.T, "late"]
+        agent._interruptible_streaming_api_call({})
+        self.assertEqual(ad.posts, [["🔧 Bash: a"]], "nothing after the turn went stale")
+
+    def test_status_lines_are_not_in_the_reply_when_a_turn_ends_in_tools(self):
+        agent, content = self.run_turn(False, [self.T, "Done.", self.S, "🔧 Bash"], adapter=self.Adapter())
+        self.assertEqual(content, "Done.")
+
+    def test_without_a_gateway_turn_status_lines_post_like_tool_headlines(self):
+        agent, content = self.run_turn(False, [
+            self.T, "Checking.", self.S, "🔧 Bash: a", self.S, "📊 1m00s", self.F, self.T, "The answer."])
+        self.assertEqual(agent.interim, ["Checking.\n🔧 Bash: a\n📊 1m00s"])
+        self.assertEqual(content, "The answer.")
+
+    def test_a_failed_post_falls_back_to_progress_messages(self):
+        agent, content = self.run_turn(False, [self.S, "🔧 Bash: a", self.S, "🔧 Bash: b", self.F,
+                                               self.T, "The answer."], adapter=self.Adapter(fail_send=True))
+        self.assertEqual(agent.interim, ["🔧 Bash: a\n🔧 Bash: b"], "nothing collected is lost")
+        self.assertEqual(content, "The answer.")
+
+    def test_streaming_display_falls_back_to_inline_status(self):
+        agent, content = self.run_turn(True, [self.T, "Checking.", self.S, "🔧 Bash", self.T, "answer"])
+        self.assertEqual(agent.shown, ["Checking.", None, "🔧 Bash\n", None, "answer"])
+        self.assertEqual(content, "Checking.answer")
 
     def test_streaming_display_gets_a_new_message_per_run(self):
         agent, content = self.run_turn(True, [self.T, "Checking.", self.O, "🔧 Bash\n", self.F, self.T, "answer"])
@@ -581,16 +688,17 @@ class WatchdogTests(unittest.TestCase):
     running tool whose processes use no CPU and do no I/O. Claude's tool heartbeats prove only that claude is
     alive, so they never count. A busy tool may run past the idle limit; --timeout stays as the hard cap."""
 
-    def _run(self, *args, prompt="USE_TOOL", **env):
+    def _run(self, *args, prompt="USE_TOOL", raw_markers=False, live_status=False, **env):
         b = Bridge(*args, **env)
         try:
-            payload = {"model": "sonnet", "stream": True, "claude_bridge": {"session_id": "thread-wd", "segments": True},
+            ext = {"session_id": "thread-wd", "segments": True, **({"live_status": True} if live_status else {})}
+            payload = {"model": "sonnet", "stream": True, "claude_bridge": ext,
                        "messages": [{"role": "user", "content": prompt}]}
             started = time.time()
             raw = b.raw_post(json.dumps(payload).encode(), {"content-type": "application/json"}, 60).read().decode()
             text = "".join(json.loads(l[6:])["choices"][0]["delta"].get("content") or "" for l in raw.splitlines()
                            if l.startswith("data: ") and l != "data: [DONE]")
-            return bridge.MARKERS.sub("", text), time.time() - started
+            return (text if raw_markers else bridge.MARKERS.sub("", text)), time.time() - started
         finally:
             b.stop()
 
@@ -652,6 +760,19 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("tools (1 proc) cpu", stats[-1])
         self.assertIn("running Bash", stats[-1])
         self.assertIn("reply[", text)
+
+    def test_live_status_marks_headlines_and_stats_as_status_lines(self):
+        text, _ = self._run("--stats-interval", "1", "--idle-timeout", "0", raw_markers=True, live_status=True,
+                            FAKE_CLAUDE_TOOL_SECONDS="2.5", FAKE_CLAUDE_TOOL_MODE="busy")
+        S = bridge.STATUS
+        self.assertIn(S + "🔧 ", text)
+        self.assertIn(S + "📊 ", text)
+        self.assertNotIn(bridge.TOOL_RUN, text, "no progress run: everything status goes to the live post")
+        self.assertIn(bridge.TEXT_RUN + "reply[", text, "the answer opens a text run of its own")
+        self.assertNotIn(S + "reply[", text)
+        plain, _ = self._run("--stats-interval", "1", "--idle-timeout", "0", raw_markers=True,
+                             FAKE_CLAUDE_TOOL_SECONDS="1.5", FAKE_CLAUDE_TOOL_MODE="busy")
+        self.assertNotIn(S, plain, "only a client that asked for live_status gets STATUS")
 
     def test_no_stats_when_disabled(self):
         text, _ = self._run("--stats-interval", "0", FAKE_CLAUDE_TOOL_SECONDS="2.5", FAKE_CLAUDE_TOOL_MODE="busy")
