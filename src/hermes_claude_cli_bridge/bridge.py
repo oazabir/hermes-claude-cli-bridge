@@ -742,6 +742,404 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     return result, "".join(stderr_buf)
 
 
+# ------------------------------------------------------------------ live sessions (--live)
+# One long-lived `claude -p --input-format stream-json` per thread instead of one process per message, so
+# background agents and jobs outlive the reply and a new message joins the same running session. What this
+# relies on (probed against claude 2.x): a user message written to stdin is echoed back (--replay-user-messages,
+# same uuid) at the moment claude takes it in, and the next `result` answers it -- a message sent mid-turn is
+# folded into that turn; a background task that finishes while claude is idle starts a turn by itself
+# (init ... result); an `interrupt` control_request ends the current turn (result error_during_execution) and
+# keeps the process; closing stdin stops the background tasks and exits.
+
+LIVE_FLAGS = ["--input-format", "stream-json", "--replay-user-messages"]
+LIVE_NOTE = ("Background work in this chat: your Claude session keeps running between messages. Agents and commands "
+             "you start with run_in_background keep going after you reply, and when one finishes you are invoked "
+             "again and what you then say is posted to this chat. For long work, start it in the background, say "
+             "what you started, and end your turn: do not wait on it or poll it.")
+INTERRUPT_GRACE = 15.0  # seconds an interrupted turn gets to end before its process is killed
+
+
+class _Outbox:
+    """What claude said on its own (a turn started by a finished background task) with nobody waiting for it.
+    The Hermes plugin polls GET /v1/claude_bridge/outbox?after=<id> and posts each message to its thread."""
+
+    KEEP = 500
+
+    def __init__(self):
+        self.mu = threading.Lock()
+        self.items: list[dict] = []
+        self.last = 0
+
+    def add(self, hsid, sid, text):
+        with self.mu:
+            self.last += 1
+            self.items.append({"id": self.last, "session_id": hsid, "thread": sid, "text": text, "ts": int(time.time())})
+            del self.items[:-self.KEEP]
+        print(f"[bridge] outbox #{self.last}: {len(text)} chars from thread {sid[:8]} (claude spoke on its own)",
+              file=sys.stderr)
+
+    def since(self, after: int):
+        with self.mu:
+            return [i for i in self.items if i["id"] > after], self.last
+
+
+OUTBOX = _Outbox()
+
+
+class _Turn:
+    """One HTTP turn attached to a live session: its callbacks, and what the reader has seen for it."""
+
+    def __init__(self, on_text, on_reasoning, on_tool):
+        self.uid = str(uuid.uuid4())
+        self.on_text, self.on_reasoning, self.on_tool = on_text, on_reasoning, on_tool
+        self.accepted = False  # claude has taken our message in (its echo arrived)
+        self.result = None
+        self.done = threading.Event()
+        self.t0 = time.monotonic()
+        self.live = {"event": self.t0, "text": 0.0, "tools": {}}
+        self.seen_tools: set = set()
+        self.sink_failed = False  # the client's stream broke; the client watcher ends the turn
+
+    def call(self, fn, *args):
+        if fn is None or self.sink_failed:
+            return
+        try:
+            fn(*args)
+        except Exception:
+            self.sink_failed = True
+
+
+class LiveSession:
+    """A running `claude` for one thread. Turns are written to its stdin; its stdout is read by one thread that
+    hands each event to the attached turn, or -- when claude acts on its own -- collects the reply for the
+    outbox."""
+
+    def __init__(self, sid: str, hsid, key, cmd: list[str], cwd: str):
+        self.sid, self.hsid, self.key = sid, hsid, key
+        self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
+                                     env=claude_env())
+        self.mu = threading.Lock()  # guards turn / spont / bg_tasks
+        self.wmu = threading.Lock()  # one writer on stdin at a time
+        self.turn: _Turn | None = None
+        self.spont: list[str] = []  # main-thread text of a turn claude started by itself
+        self.bg_tasks: set = set()
+        self.stderr: list[str] = []
+        self.last = time.monotonic()  # last activity: a turn, or anything claude printed
+        self.closing = False
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=lambda: self.stderr.append(self.proc.stderr.read() or ""), daemon=True).start()
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None and not self.closing
+
+    def busy(self) -> bool:
+        return self.turn is not None or bool(self.bg_tasks) or bool(self.spont)
+
+    def _write(self, obj) -> None:
+        with self.wmu:
+            self.proc.stdin.write(json.dumps(obj) + "\n")
+            self.proc.stdin.flush()
+
+    def begin(self, prompt: str, on_text, on_reasoning=None, on_tool=None) -> _Turn:
+        t = _Turn(on_text, on_reasoning, on_tool)
+        with self.mu:
+            self.turn = t
+            self.last = time.monotonic()
+        try:
+            self._write({"type": "user", "uuid": t.uid, "session_id": "", "parent_tool_use_id": None,
+                         "message": {"role": "user", "content": prompt}})
+        except (OSError, ValueError):  # claude already exited (e.g. a --resume of an unknown session)
+            with self.mu:
+                if self.turn is t:
+                    self.turn = None
+            t.done.set()
+        return t
+
+    def interrupt(self) -> None:
+        try:
+            self._write({"type": "control_request", "request_id": uuid.uuid4().hex,
+                         "request": {"subtype": "interrupt"}})
+        except (OSError, ValueError):
+            pass
+
+    def close(self, grace: float = INTERRUPT_GRACE) -> None:
+        """Stop politely (closing stdin stops background tasks and exits), then by force."""
+        self.closing = True
+        try:
+            with self.wmu:
+                self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.proc.wait(grace)
+        except subprocess.TimeoutExpired:
+            _kill_tree(self.proc)
+
+    def kill(self) -> None:
+        self.closing = True
+        _kill_tree(self.proc)
+
+    def _read(self) -> None:
+        try:
+            for line in self.proc.stdout:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                with self.mu:
+                    self.last = time.monotonic()
+                    self._route(ev)
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self.mu:
+                t, self.turn = self.turn, None
+                self._flush_spont()
+            if t is not None:
+                t.done.set()
+
+    def _route(self, ev: dict) -> None:
+        kind, parent = ev.get("type"), ev.get("parent_tool_use_id")
+        if kind == "system" and ev.get("subtype") == "background_tasks_changed":
+            self.bg_tasks = {x.get("task_id") for x in ev.get("tasks") or [] if isinstance(x, dict)}
+            return
+        t = self.turn
+        if kind == "user" and ev.get("isReplay"):
+            if t is not None and not t.accepted and ev.get("uuid") == t.uid:
+                t.accepted = True  # from here on the output answers this turn
+                t.live["event"] = time.monotonic()
+                if self.spont:  # claude was mid-way through a turn of its own and folded our message into it
+                    text, self.spont = "".join(self.spont), []
+                    t.call(t.on_text, text)
+            return
+        if t is not None and t.accepted:
+            self._to_turn(t, ev)
+            return
+        # nobody is waiting: a turn claude started by itself (a background task finished)
+        if kind == "stream_event" and not parent:
+            d = (ev.get("event") or {}).get("delta") or {}
+            if d.get("type") == "text_delta" and d.get("text"):
+                self.spont.append(d["text"])
+        elif kind == "result":
+            self._flush_spont()
+
+    def _flush_spont(self) -> None:
+        text, self.spont = "".join(self.spont).strip(), []
+        if text:
+            OUTBOX.add(self.hsid, self.sid, text)
+
+    def _to_turn(self, t: _Turn, ev: dict) -> None:
+        kind, now = ev.get("type"), time.monotonic()
+        if not (kind == "tool_progress" and ev.get("heartbeat")):
+            t.live["event"] = now
+        if kind == "stream_event":
+            d = (ev.get("event") or {}).get("delta") or {}
+            if d.get("type") == "text_delta" and d.get("text"):
+                t.live["text"] = now
+                t.call(t.on_text, d["text"])
+            elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                t.call(t.on_reasoning, d["thinking"])
+        elif kind == "assistant":
+            for blk in (ev.get("message") or {}).get("content") or []:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id") not in t.seen_tools:
+                    t.seen_tools.add(blk.get("id"))
+                    t.live["tools"][blk.get("id")] = (blk.get("name", "?"), now)
+                    t.call(t.on_tool, tool_headline(blk.get("name", "?"), blk.get("input")), bool(ev.get("parent_tool_use_id")))
+        elif kind == "user":
+            for blk in (ev.get("message") or {}).get("content") or []:
+                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                    t.live["tools"].pop(blk.get("tool_use_id"), None)
+        elif kind == "result":
+            t.result = ev
+            self.turn = None
+            t.done.set()
+
+
+_live: dict[str, LiveSession] = {}
+_live_mu = threading.Lock()
+
+
+def _live_key(model, opts, cwd) -> tuple:
+    """What a running claude cannot change: a different one needs a new process. The system prompt is left out
+    on purpose (Hermes' session context varies by message; prompt files change at the next restart)."""
+    return (model, opts.get("effort"), tuple(opts.get("add_dirs") or ()), opts.get("autocompact"), cwd)
+
+
+def _live_session(sid, hsid, key, cmd, cwd) -> LiveSession:
+    stale = []
+    with _live_mu:
+        s = _live.get(sid)
+        if s is not None and s.alive() and s.key != key and s.busy():
+            # a different model/effort/dirs would need a new process, but that would stop its background work:
+            # keep this one until it is idle, and say so once
+            if not getattr(s, "key_warned", False):
+                s.key_warned = True
+                print(f"[bridge] thread {sid[:8]}: settings changed but its claude is busy; keeping the running one",
+                      file=sys.stderr)
+        elif s is not None and (not s.alive() or s.key != key):
+            stale.append(_live.pop(sid))
+            s = None
+        if s is None:
+            limit = max(1, getattr(CFG, "max_live", 8))
+            while len(_live) >= limit:  # make room: the longest-idle session with nothing running
+                idle = [x for x in _live.values() if not x.busy()]
+                if not idle:
+                    raise Busy(f"bridge has {len(_live)} live Claude sessions, all busy; try again shortly")
+                victim = min(idle, key=lambda x: x.last)
+                stale.append(_live.pop(victim.sid))
+            s = LiveSession(sid, hsid, key, cmd, cwd)
+            _live[sid] = s
+    for x in stale:
+        threading.Thread(target=x.close, daemon=True).start()
+    return s
+
+
+def _drop_live(s: LiveSession) -> None:
+    with _live_mu:
+        if _live.get(s.sid) is s:
+            _live.pop(s.sid)
+
+
+def run_live(sid, hsid, key, cmd, prompt, cwd, on_text, on_reasoning=None, on_tool=None, client_gone=None,
+             on_stats=None):
+    """One turn on the thread's live claude. Same contract as run_claude: (result_event, stderr_text). A stop
+    (the hard cap, the idle watchdog, or the caller hanging up) interrupts the turn and leaves the process --
+    and its background work -- running; only a process that ignores the interrupt is killed."""
+    if not _slots.acquire(timeout=getattr(CFG, "queue_timeout", 120)):
+        raise Busy(f"bridge is at capacity ({CFG.max_concurrency} concurrent turns); try again shortly")
+    try:
+        s = _live_session(sid, hsid, key, cmd, cwd)
+        t = s.begin(prompt, on_text, on_reasoning, on_tool)
+        cap, idle = CFG.timeout, getattr(CFG, "idle_timeout", 0) or 0
+        every = (getattr(CFG, "stats_interval", 0) or 0) if on_stats else 0
+        check = getattr(CFG, "client_check_interval", 5.0) or 0
+        poll = max(0.2, min([5.0] + [x / 4 for x in (cap, idle, every, check) if x and x > 0]))
+
+        def _sample():
+            try:
+                return sample_tree(s.proc.pid)
+            except Exception:
+                return None
+
+        prev = last = _sample()
+        below, due, gone, stopped, next_check = t.t0, t.t0 + every, False, None, t.t0 + (check or 0)
+        while not t.done.wait(poll):
+            now = time.monotonic()
+            if check and now >= next_check:
+                next_check = now + check
+                try:
+                    gone = gone or bool(client_gone and client_gone())
+                except Exception:
+                    pass
+            if t.sink_failed:
+                gone = True
+            cur = _sample() if prev is not None else None
+            tools = dict(t.live["tools"])
+            if cur is not None:
+                try:
+                    u = tree_usage(prev, cur, s.proc.pid)
+                    if u["active"] or (u["claude_cpu"] > 0.1 * poll and any(n != "Bash" for n, _ in tools.values())):
+                        below = now
+                except Exception:
+                    cur = None
+            if gone:
+                stopped = "caller disconnected"
+            elif cap and now - t.t0 >= cap:
+                stopped = f"hit the {cap:g}s turn limit"
+            elif idle and not t.accepted and now - max(t.t0, s.last) >= idle:
+                stopped = f"claude did not take the message in for {idle:g}s"
+            elif idle and t.accepted and now - max(t.live["event"], below) >= idle:
+                names = ", ".join(dict.fromkeys(tool_headline(n, {}) for n, _ in tools.values()))
+                stopped = f"{names} idle for {idle:g}s (no CPU or I/O)" if tools else f"no output from claude for {idle:g}s"
+            if stopped and not t.accepted:
+                # claude has not taken the message in (busy with a turn of its own): leave it queued -- claude will
+                # answer it later and the answer goes to the outbox -- instead of interrupting work it is doing
+                with s.mu:
+                    if not t.accepted and s.turn is t:
+                        s.turn = None
+                        print(f"[bridge] detaching turn on {sid[:8]} after {now - t.t0:.0f}s: {stopped}; the answer "
+                              f"will be posted when claude gets to it", file=sys.stderr)
+                        stopped += "; claude will answer in this chat when it gets to the message"
+                        break
+            if stopped:
+                print(f"[bridge] interrupting live turn on {sid[:8]} after {now - t.t0:.0f}s: {stopped}", file=sys.stderr)
+                s.interrupt()
+                if not t.done.wait(INTERRUPT_GRACE):
+                    print(f"[bridge] live claude {s.proc.pid} ignored the interrupt; killing it", file=sys.stderr)
+                    _drop_live(s)
+                    s.kill()
+                    t.done.wait(5)
+                break
+            if every and now >= due:
+                while due <= now:
+                    due += every
+                if now - t.live["text"] >= min(10.0, every):
+                    running = [(tool_headline(n, {}), now - st) for n, st in tools.values()]
+                    try:
+                        on_stats(stats_line(now - t.t0, every, tree_usage(last or {}, cur, s.proc.pid) if cur is not None else None,
+                                            running, now - t.live["event"]))
+                    except Exception:
+                        pass
+                    last = cur
+            prev = cur if cur is not None else prev
+        with s.mu:
+            if s.turn is t:
+                s.turn = None  # a turn that was stopped before claude took the message in
+        if not s.alive() or t.result is None and s.proc.poll() is not None:
+            _drop_live(s)
+            if s.proc.poll() is not None:
+                try:
+                    s.proc.wait(2)
+                except subprocess.TimeoutExpired:
+                    pass
+        if stopped and stopped.startswith("caller disconnected"):
+            raise ClientGone("caller disconnected; the turn was interrupted")
+        if stopped:
+            raise RuntimeError(f"claude turn stopped: {stopped}")
+        time.sleep(0.05)  # let the stderr reader catch up on a process that just died
+        return t.result, "".join(s.stderr)
+    finally:
+        _slots.release()
+
+
+def _live_reaper() -> None:
+    """Close live sessions nobody is using: idle past --live-idle with no background work, or with background
+    work still running but no turn for --timeout (so a runaway job cannot live forever)."""
+    while True:
+        time.sleep(max(0.2, min(15.0, (getattr(CFG, "live_idle", 900) or 900) / 3)))
+        try:
+            now, idle_s, cap = time.monotonic(), getattr(CFG, "live_idle", 900) or 0, getattr(CFG, "timeout", 0) or 0
+            doomed = []
+            with _live_mu:
+                for sid, s in list(_live.items()):
+                    if s.proc.poll() is not None:
+                        doomed.append((_live.pop(sid), "exited"))
+                    elif s.turn is None and not s.spont and not s.bg_tasks and idle_s and now - s.last >= idle_s:
+                        doomed.append((_live.pop(sid), f"idle {now - s.last:.0f}s"))
+                    elif s.turn is None and s.bg_tasks and cap and now - s.last >= cap:
+                        doomed.append((_live.pop(sid), f"background work quiet for {now - s.last:.0f}s"))
+            for s, why in doomed:
+                print(f"[bridge] closing live session {s.sid[:8]}: {why}", file=sys.stderr)
+                if s.bg_tasks:
+                    OUTBOX.add(s.hsid, s.sid, f"_(stopped {len(s.bg_tasks)} background task(s): no activity for "
+                                              f"{now - s.last:.0f}s, over the {cap:g}s limit)_")
+                s.close()
+        except Exception as e:  # never let housekeeping kill the server
+            print(f"[bridge] live reaper failed: {e!r}", file=sys.stderr)
+
+
+def close_all_live() -> None:
+    with _live_mu:
+        sessions = list(_live.values())
+        _live.clear()
+    threads = [threading.Thread(target=s.close, args=(5.0,), daemon=True) for s in sessions]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(8)
+
+
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 PROMPTS = ("agents", "self-learn", "subagents")  # opt-in prompt files shipped with the package; "all" = every one
 
@@ -797,6 +1195,7 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None,
                 *(_read_prompt_file(f) for f in CFG.append_system_prompt_file),
                 ext.get("append_system_prompt"),
                 hermes_system(messages) if CFG.forward_system else (session_context(messages) if CFG.session_context else ""),
+                LIVE_NOTE if getattr(CFG, "live", False) and ext.get("session_id") else "",
             ) if p
         ),
         "autocompact": ext.get("autocompact") or CFG.autocompact,
@@ -820,16 +1219,22 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None,
         raise Busy("this conversation is still processing the previous message")
     try:
         state = _load_state()
-        known = sid in state
+        known = sid in state or sid in _live
         # the state file is a hint; error text below self-heals a wrong guess
         for attempt in range(2):
             resume = known
             prompt = latest_turn(messages) if resume else transcript(messages)
             streamed: list[str] = []
-            res, err = run_claude(
-                build_cmd(model=model, session=sid, resume=resume, opts=opts, persist=True),
-                prompt, state.get(sid, {}).get("cwd", cwd),
-                lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool, client_gone, on_stats)
+            run_cwd = state.get(sid, {}).get("cwd", cwd)
+            cmd = build_cmd(model=model, session=sid, resume=resume, opts=opts, persist=True)
+            if getattr(CFG, "live", False):
+                res, err = run_live(sid, hsid, _live_key(model, opts, run_cwd), cmd + LIVE_FLAGS, prompt, run_cwd,
+                                    lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool, client_gone,
+                                    on_stats)
+            else:
+                res, err = run_claude(cmd, prompt, run_cwd,
+                                      lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool, client_gone,
+                                      on_stats)
             failed = res is None or res.get("is_error")
             blob = (err + json.dumps(res or {})).lower()
             if failed and not streamed and attempt == 0:
@@ -927,8 +1332,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") in ("/health", "/healthz"):
-            return self._json(200, {"ok": True, "sessions": len(_load_state()),
+            return self._json(200, {"ok": True, "sessions": len(_load_state()), "live": len(_live),
                                     "session_ttl_days": getattr(CFG, "session_ttl_days", 0)})
+        if self.path.split("?")[0].rstrip("/") == "/v1/claude_bridge/outbox":
+            if self.headers.get("Origin"):
+                return self._json(403, {"error": {"message": "cross-origin requests are not accepted"}})
+            token = getattr(CFG, "auth_token", "")
+            if token and self.headers.get("Authorization", "") != "Bearer " + token:
+                return self._json(401, {"error": {"message": "invalid or missing bearer token"}})
+            m = re.search(r"[?&]after=(-?\d+)", self.path)
+            items, last = OUTBOX.since(int(m.group(1)) if m else 0)
+            return self._json(200, {"messages": items, "last": last})
         if self.path.rstrip("/") == "/v1/models":
             return self._json(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "claude-code"} for m in MODELS]})
         if self.path.startswith("/v1/models/") and self.path.rsplit("/", 1)[1] in MODELS:
@@ -1138,6 +1552,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "7200")),
                     help="hard cap on one Claude turn, busy or not (default 7200; 0 = none). Hermes' gateway_timeout "
                          "is an inactivity limit and the stats line keeps it alive, so this is the only wall-clock cap")
+    ap.add_argument("--live", action="store_true", default=env("CLAUDE_BRIDGE_LIVE") == "1",
+                    help="keep one claude process per thread (stream-json input): background agents and jobs outlive "
+                         "the reply, and what claude says when they finish goes to GET /v1/claude_bridge/outbox, "
+                         "which the Hermes plugin posts to the thread")
+    ap.add_argument("--live-idle", type=float, default=float(env("CLAUDE_BRIDGE_LIVE_IDLE", "900")),
+                    help="with --live: close a thread's claude after this long with no turn and no background work "
+                         "(default 900; the next message resumes the session)")
+    ap.add_argument("--max-live", type=int, default=int(env("CLAUDE_BRIDGE_MAX_LIVE", "8")),
+                    help="with --live: most claude processes kept at once; the longest-idle one is closed to make room "
+                         "(default 8)")
     ap.add_argument("--bg-wait", type=float, default=float(env("CLAUDE_BRIDGE_BG_WAIT", "0")),
                     help="after claude has answered, how long it may keep running for unfinished background work "
                          "(subagents, background Bash) before it is stopped; the reply is held back and the thread "
@@ -1194,16 +1618,24 @@ def main(argv=None):
     srv = ThreadingHTTPServer((CFG.host, CFG.port), Handler)
     srv.daemon_threads = True
     threading.Thread(target=_housekeeping_loop, daemon=True).start()
+    if CFG.live:
+        threading.Thread(target=_live_reaper, daemon=True).start()
     print(f"[bridge] listening on http://{CFG.host}:{CFG.port}/v1  (claude={CFG.claude_bin} add_dirs={CFG.add_dir} "
           f"effort={CFG.effort or 'default'} autocompact={CFG.autocompact or 'default'} "
           f"prompt_files={CFG.append_system_prompt_file or '-'} ttl_days={CFG.session_ttl_days or 'off'} "
           f"max_concurrency={CFG.max_concurrency} client_check={CFG.client_check_interval or 'off'}s "
           f"timeout={CFG.timeout or 'off'}s bg_wait={CFG.bg_wait or 0:g}s idle={CFG.idle_timeout or 'off'}s stats={CFG.stats_interval or 'off'}s "
+          f"live={'on idle=%gs max=%d' % (CFG.live_idle, CFG.max_live) if CFG.live else 'off'} "
           f"auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
+    def _term(*_):
+        raise KeyboardInterrupt  # systemd stop: fall through to close the live sessions
+    signal.signal(signal.SIGTERM, _term)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        close_all_live()
 
 
 if __name__ == "__main__":

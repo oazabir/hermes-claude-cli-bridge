@@ -18,6 +18,7 @@ shown.
   errors, changed paths; no raw logs or whole files. Filter large output first; for over ~150K tokens of input
   use sonnet instead of haiku.
 - Subagents do not start their own subagents.
-- Run agents and long commands in the foreground: never `run_in_background`, and no waiting on a background task
-  or a wakeup. This chat turn ends when you answer, and anything still running then is stopped. For long work,
-  stay in the turn (the chat shows live progress); for parallel work, send several foreground Agent calls at once.
+- Unless a "Background work in this chat" note says your session keeps running: run agents and long commands in
+  the foreground (never `run_in_background`, no waiting on a background task or a wakeup). The turn ends when you
+  answer and anything still running is stopped. Long work: stay in the turn (the chat shows live progress);
+  parallel work: several foreground Agent calls at once. With that note, follow it instead.

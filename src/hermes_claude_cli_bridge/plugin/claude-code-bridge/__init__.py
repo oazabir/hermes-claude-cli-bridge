@@ -16,13 +16,20 @@ Plugin-only (non-streaming platforms such as Mattermost):
   CLAUDE_CODE_CHUNK_CHARS         max chars per posted message, default 2000; 0 = leave splitting to Hermes
   CLAUDE_CODE_CHUNK_GAP           seconds between consecutive posts so they land in order, default 0.5
   CLAUDE_CODE_STATUS_EDIT_GAP     min seconds between edits of the live status post, default 3
+  CLAUDE_CODE_OUTBOX_POLL         seconds between polls of the bridge outbox (with bridge --live), default 3;
+                                  0 = off
+  CLAUDE_CODE_BRIDGE_TOKEN        bearer token, if the bridge runs with --auth-token
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import threading
 import time
+import urllib.error
+import urllib.request
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -252,6 +259,80 @@ def _show_as_tool_run(agent, text, final=False):
         runs.append(entry)
 
 
+# With bridge --live a thread's claude keeps running after the reply, and when a background agent or job finishes
+# it speaks on its own. The bridge queues that in its outbox; this poller posts each message to its thread through
+# the gateway adapter of that thread's last turn (recorded below), in the same chunks as a reply.
+OUTBOX_POLL = float(os.getenv("CLAUDE_CODE_OUTBOX_POLL") or 3)
+_targets: dict = {}  # Hermes session id -> (adapter, chat_id, thread metadata, gateway loop)
+_poller: list = []
+_poller_lock = threading.Lock()
+OUTBOX_KEEP = 3600  # seconds an undeliverable message is retried (its thread not seen yet, or the post failed)
+
+
+def _remember_target(agent) -> None:
+    runner = getattr(getattr(agent, "tool_progress_callback", None), "__self__", None)
+    ctx = getattr(runner, "_ctx", None)
+    sid = getattr(agent, "session_id", None)
+    target = (getattr(ctx, "_status_adapter", None), getattr(ctx, "_status_chat_id", None),
+              getattr(ctx, "_status_thread_metadata", None), getattr(ctx, "_loop_for_step", None))
+    if not (sid and target[0] and target[1] and target[3] and callable(getattr(target[0], "send", None))):
+        return
+    _targets[sid] = target
+    with _poller_lock:  # two turns at once must not start two pollers (every message would be posted twice)
+        if OUTBOX_POLL > 0 and not _poller:
+            th = threading.Thread(target=_poll_outbox, name="claude-bridge-outbox", daemon=True)
+            _poller.append(th)
+            th.start()
+
+
+def _deliver(msg) -> bool:
+    """Post a message's chunks, resuming after the last one that went out (msg["_sent"]). True when all are."""
+    import asyncio
+    target = _targets.get(msg.get("session_id"))
+    if target is None:
+        return False
+    adapter, chat_id, meta, loop = target
+    chunks = _split(msg.get("text") or "", CHUNK_CHARS)
+    while msg.get("_sent", 0) < len(chunks):
+        try:
+            res = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, chunks[msg.get("_sent", 0)], metadata=meta),
+                                                   loop).result(timeout=30)
+        except Exception:
+            return False
+        if getattr(res, "success", True) is False:
+            return False
+        msg["_sent"] = msg.get("_sent", 0) + 1
+    return True
+
+
+def _poll_outbox() -> None:
+    """Runs for the life of the gateway. Skips whatever was queued before it started (no thread to post it to
+    is known yet); stops for good on a bridge without an outbox (404)."""
+    url = os.getenv("CLAUDE_CODE_BRIDGE_URL", "http://127.0.0.1:9181/v1").rstrip("/") + "/claude_bridge/outbox"
+    token = os.getenv("CLAUDE_CODE_BRIDGE_TOKEN", "")
+    after, pending = None, []  # pending: fetched, not delivered yet (thread unknown so far, or the post failed)
+    while True:
+        try:
+            req = urllib.request.Request(f"{url}?after={after or 0}",
+                                         headers={"Authorization": f"Bearer {token}"} if token else {})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.load(r)
+            if after is None:
+                after = int(data.get("last") or 0)
+            else:
+                for msg in data.get("messages") or []:
+                    pending.append(msg)
+                    after = max(after, int(msg.get("id") or 0))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return
+        except Exception:
+            pass
+        now = time.time()
+        pending = [m for m in pending if not _deliver(m) and now - (m.get("ts") or now) < OUTBOX_KEEP]
+        time.sleep(OUTBOX_POLL)
+
+
 def _live_post(agent) -> _LivePost:
     lp = getattr(agent, _LIVE, None)
     if lp is None:
@@ -359,6 +440,10 @@ def _install_segment_breaks() -> bool:
     def _interruptible_streaming_api_call(self, *args, **kwargs):
         setattr(self, _RUNS, None)
         setattr(self, _LIVE, None)
+        try:
+            _remember_target(self)
+        except Exception:
+            pass
         try:
             resp = call(self, *args, **kwargs)
             raw = getattr(self, _RUNS, None)

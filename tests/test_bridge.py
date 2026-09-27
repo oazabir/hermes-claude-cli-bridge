@@ -55,7 +55,7 @@ class Bridge:
              "--cwd", str(self.tmp / "ws"), "--state-file", str(self.state), "--add-dir", str(self.tmp),
              *(["--autocompact", "200k"] if autocompact else []), "--effort", "medium",
              "--append-system-prompt-file", str(self.tmp / "sys.txt"), *extra],
-            env=env, stderr=subprocess.DEVNULL)
+            env=env, stderr=None if os.environ.get("BRIDGE_TEST_STDERR") else subprocess.DEVNULL)
         for _ in range(50):
             try:
                 self.get("/health")
@@ -338,7 +338,8 @@ class PluginSegmentTests(unittest.TestCase):
             import types
             self._ctx = types.SimpleNamespace(_status_adapter=adapter, _status_chat_id="chan",
                                               _status_thread_metadata={"thread_id": "root"},
-                                              _run_still_current=lambda: not adapter.stale)
+                                              _run_still_current=lambda: not adapter.stale,
+                                              _loop_for_step=getattr(adapter, "loop", None))
 
         def _schedule(self, coro, log_message):
             import asyncio
@@ -396,6 +397,73 @@ class PluginSegmentTests(unittest.TestCase):
         self.assertTrue(last.startswith("📊 9m00s\n… "), last[:40])
         self.assertIn("step 299", last)
         self.assertNotIn("step 000", last)
+
+    def test_what_claude_says_on_its_own_is_posted_to_its_thread(self):
+        import asyncio
+        b = Bridge("--live")
+        self.addCleanup(b.stop)
+        loop = asyncio.new_event_loop()
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        ad = self.Adapter()
+        ad.loop = loop
+        self.mod.OUTBOX_POLL = 0.2
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_BRIDGE_URL": f"http://127.0.0.1:{b.port}/v1"}):
+            self.deltas = [self.T, "hi"]
+            agent = self.AIAgent(False)
+            agent.session_id = "thread-out"
+            agent.tool_progress_callback = self.Turn(ad).progress_callback
+            agent._interruptible_streaming_api_call({})  # a gateway turn: the plugin learns where this thread lives
+            time.sleep(0.5)  # the poller's first look: skip anything queued before it started
+            self.assertEqual(b.chat("go BG:0.5", "thread-out"), "launched bgtask1")
+            self.assertEqual(b.chat("go BG:0.5", "thread-unknown"), "launched bgtask1")
+            for _ in range(50):
+                if ad.posts:
+                    break
+                time.sleep(0.1)
+            time.sleep(0.5)
+        self.assertEqual(ad.posts, [["bg finished bgtask1"]], "posted once, to the known thread only")
+
+    def test_outbox_messages_wait_for_their_thread_and_survive_a_failed_post(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        ad = self.Adapter()
+        fails = [1]
+        send = ad.send
+
+        async def flaky(chat_id, content, reply_to=None, metadata=None):
+            if fails[0]:
+                fails[0] -= 1
+                raise ConnectionError("mattermost hiccup")
+            return await send(chat_id, content, reply_to, metadata)
+        ad.send = flaky
+        msg = {"id": 1, "session_id": "thread-late", "text": "done at last", "ts": time.time()}
+        self.assertFalse(self.mod._deliver(msg), "thread not known yet")
+        self.mod._targets["thread-late"] = (ad, "chan", {"thread_id": "root"}, loop)
+        self.assertFalse(self.mod._deliver(msg), "the post failed")
+        self.assertTrue(self.mod._deliver(msg))
+        self.assertTrue(self.mod._deliver(msg), "already delivered: nothing is posted twice")
+        self.assertEqual(ad.posts, [["done at last"]])
+
+    def test_concurrent_turns_start_one_outbox_poller(self):
+        self.mod.OUTBOX_POLL = 60
+        started = []
+        self.mod._poll_outbox = lambda: started.append(1) or time.sleep(1)
+        ad = self.Adapter()
+        ad.loop = object()
+        agents = []
+        for i in range(8):
+            a = self.AIAgent(False)
+            a.session_id = f"s{i}"
+            a.tool_progress_callback = self.Turn(ad).progress_callback
+            agents.append(a)
+        ts = [threading.Thread(target=self.mod._remember_target, args=(a,)) for a in agents]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        time.sleep(0.2)
+        self.assertEqual(len(started), 1)
 
     def test_a_stale_turn_stops_editing(self):
         self.mod.STATUS_EDIT_GAP = 0
@@ -874,6 +942,177 @@ class BackgroundCeilingTests(unittest.TestCase):
 
     def test_an_operator_setting_wins(self):
         self.assertEqual(self._ceiling(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="12345"), "12345")
+
+
+class LiveSessionTests(unittest.TestCase):
+    """--live: one claude per thread (stream-json input). Background work outlives the reply, what claude says when
+    it finishes lands in the outbox, and a stop interrupts the turn instead of killing the process."""
+
+    def bridge(self, *args, **env):
+        b = Bridge("--live", *args, **env)
+        self.addCleanup(b.stop)
+        return b
+
+    @staticmethod
+    def H(text):  # one earlier exchange, so latest_turn() sends only the new message
+        return [{"role": "user", "content": text}, {"role": "assistant", "content": "earlier reply"}]
+
+    @staticmethod
+    def pids(b):
+        rows = [json.loads(l) for l in b.log.read_text().splitlines()] if b.log.exists() else []
+        return [r["pid"] for r in rows if r.get("live")]
+
+    @staticmethod
+    def outbox(b, after=0, want=1, wait=10.0):
+        end = time.time() + wait
+        while True:
+            got = b.get(f"/v1/claude_bridge/outbox?after={after}")
+            if len(got["messages"]) >= want or time.time() > end:
+                return got
+
+    def test_messages_in_a_thread_share_one_process(self):
+        b = self.bridge()
+        self.assertEqual(b.chat("one", "thread-a"), "reply[new] one")
+        self.assertEqual(b.chat("two", "thread-a", history=[{"role": "user", "content": "one"},
+                                                             {"role": "assistant", "content": "reply[new] one"}]),
+                         "reply[new] two")
+        self.assertEqual(len(set(self.pids(b))), 1, "the second message went to the same running claude")
+        self.assertEqual(b.get("/health")["live"], 1)
+
+    def test_background_work_outlives_the_reply_and_its_result_goes_to_the_outbox(self):
+        b = self.bridge()
+        started = time.time()
+        self.assertEqual(b.chat("go BG:1.5", "thread-bg"), "launched bgtask1")
+        self.assertLess(time.time() - started, 1.5, "the reply does not wait for the background work")
+        got = self.outbox(b)
+        self.assertEqual([(m["session_id"], m["text"]) for m in got["messages"]], [("thread-bg", "bg finished bgtask1")])
+        self.assertEqual(self.outbox(b, after=got["last"], want=1, wait=0)["messages"], [], "the cursor works")
+
+    def test_a_new_message_joins_the_running_process_and_background_work_continues(self):
+        b = self.bridge()
+        b.chat("go BG:2", "thread-j")
+        self.assertEqual(b.chat("status?", "thread-j", history=[{"role": "user", "content": "go BG:2"},
+                                                                 {"role": "assistant", "content": "launched bgtask1"}]),
+                         "reply[new] status?")
+        self.assertEqual(len(set(self.pids(b))), 1)
+        self.assertEqual([m["text"] for m in self.outbox(b)["messages"]], ["bg finished bgtask1"],
+                         "the background task was not stopped by the new message")
+
+    def test_the_hard_cap_interrupts_the_turn_but_keeps_the_process(self):
+        b = self.bridge("--timeout", "1.5", "--idle-timeout", "0")
+        started = time.time()
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            b.chat("SLOW:30", "thread-cap")
+        self.assertIn("hit the 1.5s turn limit", cm.exception.read().decode())
+        cm.exception.close()
+        self.assertLess(time.time() - started, 10)
+        self.assertEqual(b.chat("again", "thread-cap", history=self.H("SLOW:30")), "reply[new] again")
+        self.assertEqual(len(set(self.pids(b))), 1, "the interrupt kept the process")
+
+    def test_a_caller_that_hangs_up_interrupts_the_turn_and_keeps_the_process(self):
+        b = self.bridge("--client-check-interval", "0.3", "--idle-timeout", "0")
+        payload = json.dumps({"model": "sonnet", "stream": True, "claude_bridge": {"session_id": "thread-gone"},
+                              "messages": [{"role": "user", "content": "SLOW:30"}]}).encode()
+        sock = socket.create_connection(("127.0.0.1", b.port))
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                     + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
+        time.sleep(1.0)
+        sock.close()
+        time.sleep(2.0)
+        self.assertEqual(b.chat("next", "thread-gone", history=self.H("SLOW:30")), "reply[new] next")
+        self.assertEqual(len(set(self.pids(b))), 1)
+
+    def test_a_crashed_process_is_replaced_and_the_session_resumed(self):
+        b = self.bridge()
+        b.chat("hello", "thread-crash")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            b.chat("DIE", "thread-crash", history=self.H("hello"))
+        cm.exception.close()
+        self.assertEqual(b.chat("after", "thread-crash", history=self.H("hello") + self.H("DIE")),
+                         "reply[resume] after")
+        self.assertEqual(len(set(self.pids(b))), 2)
+
+    def test_an_idle_process_is_closed_and_the_next_message_resumes(self):
+        b = self.bridge("--live-idle", "1")
+        b.chat("hello", "thread-idle")
+        time.sleep(2.5)
+        self.assertEqual(b.get("/health")["live"], 0)
+        self.assertEqual(b.chat("back", "thread-idle", history=self.H("hello")), "reply[resume] back")
+
+    def test_background_work_keeps_an_idle_process_open(self):
+        b = self.bridge("--live-idle", "0.6")
+        b.chat("go BG:2.5", "thread-keep")
+        time.sleep(1.5)
+        self.assertEqual(b.get("/health")["live"], 1, "not closed while its background task runs")
+        self.assertEqual([m["text"] for m in self.outbox(b)["messages"]], ["bg finished bgtask1"])
+
+    def test_max_live_closes_the_longest_idle_process(self):
+        b = self.bridge("--max-live", "1")
+        b.chat("a", "thread-1")
+        b.chat("b", "thread-2")
+        self.assertEqual(b.get("/health")["live"], 1)
+        self.assertEqual(b.chat("a2", "thread-1", history=self.H("a")), "reply[resume] a2")
+
+    def test_a_different_model_needs_a_new_process(self):
+        b = self.bridge()
+        b.chat("a", "thread-m")
+        b.post([{"role": "user", "content": "a"}, {"role": "user", "content": "b"}], "thread-m", model="opus")
+        self.assertEqual(len(set(self.pids(b))), 2)
+
+    def test_claude_is_told_that_background_work_continues(self):
+        b = self.bridge()
+        b.chat("hi", "thread-note")
+        call = b.calls()[0]
+        self.assertIn("Background work in this chat", call[call.index("--append-system-prompt") + 1])
+        plain = Bridge()
+        self.addCleanup(plain.stop)
+        plain.chat("hi", "thread-note")
+        call = plain.calls()[0]
+        self.assertNotIn("Background work in this chat", call[call.index("--append-system-prompt") + 1])
+
+    def test_a_busy_session_is_kept_when_settings_change(self):
+        b = self.bridge()
+        b.chat("go BG:1.5", "thread-keepkey")
+        b.post(self.H("go BG:1.5") + [{"role": "user", "content": "now opus"}], "thread-keepkey", model="opus")
+        self.assertEqual(len(set(self.pids(b))), 1, "the background task was not killed for a model switch")
+        self.assertEqual([m["text"] for m in self.outbox(b)["messages"]], ["bg finished bgtask1"])
+        b.post(self.H("now opus") + [{"role": "user", "content": "opus again"}], "thread-keepkey", model="opus")
+        self.assertEqual(len(set(self.pids(b))), 2, "once idle, the new settings get their own process")
+
+    def test_a_message_claude_has_not_taken_in_is_answered_later_in_the_outbox(self):
+        b = self.bridge("--idle-timeout", "1")
+        b.chat("go BG:0.3:4", "thread-late")  # finishes at 0.3 s, then claude works 4 s in silence on it
+        time.sleep(0.8)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            b.chat("are you there?", "thread-late", history=self.H("go BG:0.3:4"))
+        self.assertIn("claude will answer in this chat when it gets to the message", cm.exception.read().decode())
+        cm.exception.close()
+        got = self.outbox(b, want=1, wait=10)
+        self.assertEqual([m["text"] for m in got["messages"]], ["bg finished bgtask1\n\nreply[new] are you there?"])
+        self.assertEqual(len(set(self.pids(b))), 1, "nothing was interrupted or killed")
+
+    def test_outbox_refuses_cross_origin_and_checks_the_token(self):
+        b = self.bridge("--auth-token", "sekret")
+        for headers, code in (({"Origin": "https://evil.example", "Authorization": "Bearer sekret"}, 403), ({}, 401)):
+            req = urllib.request.Request(f"http://127.0.0.1:{b.port}/v1/claude_bridge/outbox", headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(cm.exception.code, code)
+            cm.exception.close()
+
+    def test_stopping_the_bridge_closes_its_live_processes(self):
+        b = Bridge("--live")
+        b.chat("go BG:30", "thread-stop")
+        pid = self.pids(b)[0]
+        b.stop()
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        os.kill(pid, 9)
+        self.fail("a live claude outlived the bridge")
 
 
 class BundledPromptTests(unittest.TestCase):
