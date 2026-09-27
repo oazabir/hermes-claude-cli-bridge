@@ -408,7 +408,7 @@ class PluginSegmentTests(unittest.TestCase):
     def test_without_a_gateway_turn_status_lines_post_like_tool_headlines(self):
         agent, content = self.run_turn(False, [
             self.T, "Checking.", self.S, "🔧 Bash: a", self.S, "📊 1m00s", self.F, self.T, "The answer."])
-        self.assertEqual(agent.interim, ["Checking.\n🔧 Bash: a\n📊 1m00s"])
+        self.assertEqual(agent.interim, ["Checking.\n\n🔧 Bash: a\n📊 1m00s"])
         self.assertEqual(content, "The answer.")
 
     def test_a_failed_post_falls_back_to_progress_messages(self):
@@ -434,8 +434,13 @@ class PluginSegmentTests(unittest.TestCase):
             "🔧 Bash: b\n", self.T, "Found it", self.F,              # tick 2: text may be the answer, wait
             self.O, "🔧 Read: c\n", self.T, "The answer."])        # end: rest of progress, then the answer
         self.assertEqual(agent.shown, [])
-        self.assertEqual(agent.interim, ["Checking.\n🔧 Bash: a", "🔧 Bash: b", "Found it\n🔧 Read: c"])
+        self.assertEqual(agent.interim, ["Checking.\n\n🔧 Bash: a", "🔧 Bash: b", "Found it\n\n🔧 Read: c"])
         self.assertEqual(content, "The answer.", "the reply is only the answer, posted on its own")
+
+    def test_tool_lines_after_a_list_are_not_folded_into_it(self):
+        agent, _ = self.run_turn(False, [self.T, "Remaining:\n- one\n- two", self.O, "🔧 Bash: a\n", "🔧 Bash: b\n",
+                                         self.F, self.T, "Done."])
+        self.assertEqual(agent.interim, ["Remaining:\n- one\n- two\n\n🔧 Bash: a\n🔧 Bash: b"])
 
     def test_without_streaming_a_turn_ending_in_tools_keeps_its_reply(self):
         agent, content = self.run_turn(False, [self.T, "Done.", self.O, "🔧 Bash\n"])
@@ -451,7 +456,7 @@ class PluginSegmentTests(unittest.TestCase):
         paras = [f"Paragraph {i}. " + ("word " * 80).strip() for i in range(12)]  # ~420 chars each
         agent, content = self.run_turn(False, [self.T, "Checking.", self.O, "🔧 Bash\n", self.T, "\n\n".join(paras)])
         chunks = agent.interim[1:] + [content]
-        self.assertEqual(agent.interim[0], "Checking.\n🔧 Bash", "progress stays its own message")
+        self.assertEqual(agent.interim[0], "Checking.\n\n🔧 Bash", "progress stays its own message")
         self.assertTrue(all(len(c) <= 2000 for c in chunks), [len(c) for c in chunks])
         self.assertEqual("\n\n".join(chunks), "\n\n".join(paras), "cut only between paragraphs")
         self.assertGreater(len(chunks), 1)

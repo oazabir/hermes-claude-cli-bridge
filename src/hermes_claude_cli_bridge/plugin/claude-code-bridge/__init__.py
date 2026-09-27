@@ -282,9 +282,16 @@ def _pending_progress(agent) -> str:
     for i, run in enumerate(runs):
         if run[0] == "text" and i == len(runs) - 1:
             break
-        parts.append(run[1][run[2]:].strip())
+        part = run[1][run[2]:].strip()
         run[2] = len(run[1])
-    return "\n".join(p for p in parts if p)
+        if part:
+            parts.append((run[0], part))
+    # a blank line where text meets tool lines: after a Markdown list, a single newline would fold every
+    # following line into its last item (one run-on paragraph in Mattermost)
+    out = ""
+    for i, (kind, part) in enumerate(parts):
+        out += ("" if i == 0 else "\n" if kind == parts[i - 1][0] == "tool" else "\n\n") + part
+    return out
 
 
 def _post_progress(agent) -> None:
