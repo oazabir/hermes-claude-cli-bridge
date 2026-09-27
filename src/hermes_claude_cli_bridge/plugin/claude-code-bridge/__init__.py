@@ -124,7 +124,11 @@ def _post(agent, texts) -> bool:
     """Post each text as interim message(s) of at most CHUNK_CHARS, in order. True if anything was posted."""
     cb = getattr(agent, "interim_assistant_callback", None)
     posted = False
-    for chunk in (c for t in texts for c in _split(t, CHUNK_CHARS)) if cb else ():
+    chunks = [c for t in texts for c in _split(t, CHUNK_CHARS)] if cb else []
+    lp = getattr(agent, _LIVE, None)
+    if chunks and lp is not None:
+        lp.freeze()  # this text lands below the status post: finish that one, the next status line starts a new one
+    for chunk in chunks:
         if posted and CHUNK_GAP > 0:
             time.sleep(CHUNK_GAP)
         try:
@@ -155,6 +159,16 @@ class _LivePost:
                        and callable(getattr(self.adapter, "send", None)))
         self.stats, self.tools = "", []
         self.dirty, self.last, self.sent, self.mid = False, 0.0, None, None
+
+    def freeze(self):
+        """Give the current post its final state and stop editing it. Mattermost neither moves nor notifies an
+        edited post, so once text is posted below it the status would update out of sight; the next status line
+        starts a new post (with the latest stats) under that text."""
+        if self.mid is None and self.sent is None:
+            return
+        if self.dirty:
+            self.push(final=True)
+        self.mid, self.sent, self.tools, self.dirty = None, None, [], False
 
     def add(self, line):
         if line.startswith("📊"):
@@ -257,6 +271,8 @@ def _commit_status(agent, runs, fire=None) -> None:
         return
     lp = _live_post(agent)
     if lp.ok:
+        if agent.stream_delta_callback is None:
+            _post_progress(agent)  # Claude's text before this tool call goes out first, so the status sits below it
         lp.add(line)
         lp.push()
         return
@@ -277,10 +293,12 @@ def _shown_runs(agent):
 def _pending_progress(agent) -> str:
     """Runs not yet shown. Text still streaming may be the answer, so it waits until the next run starts; at
     the end the last text run IS the answer and is left for the reply."""
-    runs = _shown_runs(agent)
+    raw = getattr(agent, _RUNS, None) or []
     parts = []
-    for i, run in enumerate(runs):
-        if run[0] == "text" and i == len(runs) - 1:
+    for i, run in enumerate(raw):
+        if run[0].startswith("status"):
+            continue  # a status line after text still means Claude moved on: that text is not the answer
+        if run[0] == "text" and i == len(raw) - 1:
             break
         part = run[1][run[2]:].strip()
         run[2] = len(run[1])

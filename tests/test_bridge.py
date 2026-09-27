@@ -364,6 +364,20 @@ class PluginSegmentTests(unittest.TestCase):
         self.assertEqual(agent.interim, ["Checking."])
         self.assertEqual(content, "The answer.")
 
+    def test_text_below_the_status_post_freezes_it_and_status_continues_in_a_new_post(self):
+        self.mod.STATUS_EDIT_GAP = 0
+        ad = self.Adapter()
+        agent, content = self.run_turn(False, [
+            self.S, "🔧 Bash: a", self.S, "📊 1m00s", self.F,
+            self.T, "Step one done.", self.S, "🔧 Bash: b", self.F,
+            self.S, "📊 2m00s", self.S, "🔧 Bash: c", self.F,
+            self.T, "The answer."], adapter=ad)
+        self.assertEqual(agent.interim, ["Step one done."])
+        self.assertEqual(len(ad.posts), 2, ad.posts)
+        self.assertEqual(ad.posts[0][-1], "📊 1m00s\n🔧 Bash: a", "frozen with its final state")
+        self.assertEqual(ad.posts[1][-1], "📊 2m00s\n🔧 Bash: b\n🔧 Bash: c", "what came after the text, below it")
+        self.assertEqual(content, "The answer.")
+
     def test_edits_are_throttled_but_the_last_state_always_lands(self):
         self.mod.STATUS_EDIT_GAP = 3600
         ad = self.Adapter()
