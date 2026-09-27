@@ -317,7 +317,31 @@ def tool_headline(name: str, inp: dict) -> str:
 
 def _kill_tree(proc: subprocess.Popen) -> None:
     """Kill claude AND everything it spawned. claude runs bash/subagents in its own process group;
-    they inherit its stdout, so killing only the parent can leave our read loop blocked forever."""
+    they inherit its stdout, so killing only the parent can leave our read loop blocked forever. A background
+    Bash job gets a process group of its own, so every descendant's group is killed too (found before claude
+    dies: after that they are reparented and no longer look like its children). Never the bridge's own group."""
+    try:
+        tree = sample_tree(proc.pid) or {}
+    except Exception:
+        tree = {}
+    own = os.getpgid(0) if hasattr(os, "getpgid") else None
+    linux = os.path.isdir("/proc/self/task")
+    for key, e in tree.items():
+        pid = e.get("pid")
+        if not pid or pid == proc.pid:
+            continue
+        if linux:  # the same process still (pid and start time)? a reused pid must never be killed
+            cur = _proc_entry(pid)
+            if cur is None or cur[0] != key:
+                continue
+        try:
+            pg = os.getpgid(pid)
+            if hasattr(os, "killpg") and pg not in (own, 0, 1):
+                os.killpg(pg, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
         if hasattr(os, "killpg"):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -491,15 +515,21 @@ def run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None
 def claude_env() -> dict:
     """claude's environment. After the main turn has answered, `claude -p` keeps running while background work
     (subagents, background Bash, wakeups) is unfinished, for up to CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, then
-    interrupts it and exits. All that time the thread stays locked, so the chat cannot take a new message.
-    --bg-wait sets that ceiling (0 = up to --timeout); an operator's own CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS wins."""
+    interrupts it and exits. All that time the request stays open, so a chat that only posts the reply when the
+    request ends (Mattermost) shows nothing, and the work dies at the ceiling anyway. --bg-wait sets that ceiling,
+    never above --timeout; 0 (the default) ends the turn at the answer (see BG_GRACE). An operator's own
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS wins."""
     env = dict(os.environ)
     cap = getattr(CFG, "timeout", 0) or 0
     wait = getattr(CFG, "bg_wait", 0) or 0
-    if cap > 0:
-        wait = min(wait, cap) if wait > 0 else cap
+    # with 0 the bridge itself stops claude BG_GRACE after the answer (and says so); claude's own ceiling must not
+    # beat it to that, or the stop would go unreported
+    wait = (min(wait, cap) if cap > 0 else wait) if wait > 0 else BG_GRACE + 60
     env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", str(int(wait * 1000)))
     return env
+
+
+BG_GRACE = 5.0  # with --bg-wait 0: seconds claude gets after its answer to exit by itself before it is stopped
 
 
 def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None,
@@ -619,6 +649,18 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
     pending: set[str] = set()
     reply: list[str] = []
     ended = [False]
+    bg_tasks: set = set()  # claude's running background tasks, from its background_tasks_changed events
+    unfinished: set = set()  # tasks running when claude answered that have not reported "completed" since
+
+    def _end_after_answer():
+        """--bg-wait 0: the turn is over once claude has answered. If after BG_GRACE it is still up and waiting on
+        background tasks, stop it; anything else it does after the answer (it has no tasks) it may finish."""
+        end = time.monotonic() + BG_GRACE
+        while proc.poll() is None:
+            if time.monotonic() >= end and bg_tasks:
+                _kill_tree(proc)
+                return
+            time.sleep(0.2)
     try:
         for line in proc.stdout:
             try:
@@ -658,7 +700,15 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
                     if isinstance(blk, dict) and blk.get("type") == "tool_result":
                         live["tools"].pop(blk.get("tool_use_id"), None)
                         pending.discard(blk.get("tool_use_id"))
+            elif kind == "system" and ev.get("subtype") == "background_tasks_changed":
+                bg_tasks = {t.get("task_id") for t in ev.get("tasks") or [] if isinstance(t, dict)}
+            elif kind == "system" and ev.get("subtype") == "task_notification" and ev.get("status") == "completed":
+                unfinished.discard(ev.get("task_id"))
             elif kind == "result":
+                if result is None:
+                    unfinished = set(bg_tasks)
+                if result is None and not ev.get("is_error") and not (getattr(CFG, "bg_wait", 0) or 0):
+                    threading.Thread(target=_end_after_answer, daemon=True).start()
                 result = ev
         proc.wait()
     except BaseException:
@@ -674,6 +724,12 @@ def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=Non
         reader.join(5)
     if abandoned:
         raise ClientGone("caller disconnected; claude was stopped")
+    if unfinished and not stopped and result is not None and not result.get("is_error"):
+        n = len(unfinished)  # stopped after the answer: by us (--bg-wait 0) or by claude's own ceiling
+        note = (f"\n\n_({n} background task{'s' if n != 1 else ''} stopped when this reply ended: a chat turn "
+                f"ends at its answer, so run long work in the foreground)_")
+        on_text(note)
+        result = {**result, "result": (result.get("result") or "") + note}
     if stopped:
         if result is None and ended[0] and not pending and "".join(reply).strip():
             result = {"type": "result", "is_error": False, "result": "".join(reply), "usage": {}}
@@ -1082,10 +1138,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--timeout", type=float, default=float(env("CLAUDE_BRIDGE_TIMEOUT", "7200")),
                     help="hard cap on one Claude turn, busy or not (default 7200; 0 = none). Hermes' gateway_timeout "
                          "is an inactivity limit and the stats line keeps it alive, so this is the only wall-clock cap")
-    ap.add_argument("--bg-wait", type=float, default=float(env("CLAUDE_BRIDGE_BG_WAIT", "600")),
+    ap.add_argument("--bg-wait", type=float, default=float(env("CLAUDE_BRIDGE_BG_WAIT", "0")),
                     help="after claude has answered, how long it may keep running for unfinished background work "
-                         "(subagents, background Bash) before claude stops it; the thread is busy meanwhile "
-                         "(default 600; 0 = up to --timeout)")
+                         "(subagents, background Bash) before it is stopped; the reply is held back and the thread "
+                         "is busy meanwhile (default 0: the turn ends at the answer)")
     ap.add_argument("--idle-timeout", type=float, default=float(env("CLAUDE_BRIDGE_IDLE_TIMEOUT", "600")),
                     help="stop a turn after this long with nothing happening: no stream output from claude while no tool "
                          "runs, or no CPU/I/O by claude's child processes while one does (default 600; 0 = off)")
@@ -1142,7 +1198,7 @@ def main(argv=None):
           f"effort={CFG.effort or 'default'} autocompact={CFG.autocompact or 'default'} "
           f"prompt_files={CFG.append_system_prompt_file or '-'} ttl_days={CFG.session_ttl_days or 'off'} "
           f"max_concurrency={CFG.max_concurrency} client_check={CFG.client_check_interval or 'off'}s "
-          f"timeout={CFG.timeout or 'off'}s bg_wait={CFG.bg_wait or 'timeout'}s idle={CFG.idle_timeout or 'off'}s stats={CFG.stats_interval or 'off'}s "
+          f"timeout={CFG.timeout or 'off'}s bg_wait={CFG.bg_wait or 0:g}s idle={CFG.idle_timeout or 'off'}s stats={CFG.stats_interval or 'off'}s "
           f"auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
     try:
         srv.serve_forever()

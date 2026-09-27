@@ -33,6 +33,11 @@ if log:
 if os.environ.get("FAKE_CLAUDE_SPAWN_CHILD") == "1":
     # a grandchild that inherits stdout and outlives us, exactly like a `claude` Bash tool call
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+if os.environ.get("FAKE_CLAUDE_SETSID_PIDFILE"):
+    # a background job in a process group (session) of its own, like claude's run_in_background Bash
+    job = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open(os.environ["FAKE_CLAUDE_SETSID_PIDFILE"], "w").write(str(job.pid))
 if os.environ.get("FAKE_CLAUDE_SLEEP") and "NOSLEEP" not in prompt:
     # NOSLEEP lets one call in a sleepy run answer immediately, so a test can time how long a
     # FOLLOW-UP waited for the session lock without also waiting out its own sleep.
@@ -118,4 +123,14 @@ if os.environ.get("FAKE_CLAUDE_LINGER"):  # answered, then keeps running for bac
     end = time.time() + float(os.environ["FAKE_CLAUDE_LINGER"])
     while time.time() < end:
         sum(range(10000))
+bg_after = float(os.environ.get("FAKE_CLAUDE_BG_AFTER") or 0)  # keeps running this long after its result, like
+if bg_after and os.environ.get("FAKE_CLAUDE_BG_NOTASK") != "1":  # claude -p waiting on a background task
+    out({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "bgtask1", "task_type": "local_agent"}]})
 out({"type": "result", "is_error": False, "result": text, "usage": {"input_tokens": 3, "cache_read_input_tokens": 700000, "cache_creation_input_tokens": 0, "output_tokens": 5}})
+if bg_after:
+    import time
+    time.sleep(bg_after)
+    if os.environ.get("FAKE_CLAUDE_BG_NOTASK") != "1":  # UNFINISHED: claude stopped it itself (its own ceiling)
+        status = "stopped" if os.environ.get("FAKE_CLAUDE_BG_UNFINISHED") == "1" else "completed"
+        out({"type": "system", "subtype": "task_notification", "task_id": "bgtask1", "status": status})
+    out({"type": "system", "subtype": "background_tasks_changed", "tasks": []})

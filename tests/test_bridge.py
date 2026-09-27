@@ -549,6 +549,26 @@ class HardeningTests(unittest.TestCase):
         finally:
             b.stop()
 
+    def test_a_stop_also_kills_background_jobs_in_their_own_process_group(self):
+        pidfile = Path(tempfile.mkdtemp()) / "job.pid"
+        b = Bridge("--timeout", "2", FAKE_CLAUDE_SLEEP="60", FAKE_CLAUDE_SETSID_PIDFILE=str(pidfile))
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                b.chat("hang", "t", timeout=40)
+            cm.exception.close()
+            pid = int(pidfile.read_text())
+            for _ in range(20):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                os.kill(pid, 9)
+                self.fail("the background job outlived the turn")
+        finally:
+            b.stop()
+
     def test_cross_origin_post_is_refused(self):
         payload = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "pwn"}]}).encode()
         for headers, code in (({"content-type": "application/json", "origin": "https://evil.example"}, 403),
@@ -813,11 +833,44 @@ class BackgroundCeilingTests(unittest.TestCase):
     def test_ceiling_follows_bg_wait_within_the_turn_limit(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"}
         with unittest.mock.patch.dict(os.environ, env, clear=True):
-            self.assertEqual(self._ceiling(), "600000")
+            self.assertEqual(self._ceiling(), str(int((bridge.BG_GRACE + 60) * 1000)), "default: the bridge ends the turn first")
             self.assertEqual(self._ceiling("--bg-wait", "1200"), "1200000")
             self.assertEqual(self._ceiling("--bg-wait", "900", "--timeout", "300"), "300000", "never past the hard cap")
-            self.assertEqual(self._ceiling("--bg-wait", "0", "--timeout", "900"), "900000", "0: up to --timeout")
-            self.assertEqual(self._ceiling("--bg-wait", "0", "--timeout", "0"), "0", "no cap: wait indefinitely")
+            self.assertEqual(self._ceiling("--bg-wait", "900", "--timeout", "0"), "900000")
+
+    def _turn(self, *args, **env):
+        b = Bridge(*args, **env)
+        try:
+            payload = {"model": "sonnet", "stream": True, "claude_bridge": {"session_id": "thread-bgend"},
+                       "messages": [{"role": "user", "content": "go"}]}
+            started = time.time()
+            raw = b.raw_post(json.dumps(payload).encode(), {"content-type": "application/json"}, 60).read().decode()
+            text = "".join(json.loads(l[6:])["choices"][0]["delta"].get("content") or "" for l in raw.splitlines()
+                           if l.startswith("data: ") and l != "data: [DONE]")
+            return text, time.time() - started
+        finally:
+            b.stop()
+
+    def test_the_turn_ends_at_the_answer_and_says_background_work_was_stopped(self):
+        text, took = self._turn(FAKE_CLAUDE_BG_AFTER="60")
+        self.assertIn("reply[new] go", text)
+        self.assertIn("1 background task stopped when this reply ended", text)
+        self.assertNotIn("claude-bridge error", text)
+        self.assertLess(took, bridge.BG_GRACE + 5, "the reply is not held back for the background work")
+
+    def test_without_background_tasks_claude_may_finish_after_its_answer(self):
+        text, took = self._turn(FAKE_CLAUDE_BG_AFTER=str(bridge.BG_GRACE + 2), FAKE_CLAUDE_BG_NOTASK="1")
+        self.assertNotIn("background task", text)
+        self.assertGreaterEqual(took, bridge.BG_GRACE + 2)
+
+    def test_a_task_claude_itself_stops_after_the_answer_is_reported_too(self):
+        text, _ = self._turn("--bg-wait", "30", FAKE_CLAUDE_BG_AFTER="1", FAKE_CLAUDE_BG_UNFINISHED="1")
+        self.assertIn("1 background task stopped when this reply ended", text)
+
+    def test_bg_wait_lets_background_work_finish(self):
+        text, took = self._turn("--bg-wait", "30", FAKE_CLAUDE_BG_AFTER="2")
+        self.assertNotIn("background task", text)
+        self.assertIn("reply[new] go", text)
 
     def test_an_operator_setting_wins(self):
         self.assertEqual(self._ceiling(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="12345"), "12345")
