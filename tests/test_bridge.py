@@ -408,7 +408,8 @@ class PluginSegmentTests(unittest.TestCase):
         ad = self.Adapter()
         ad.loop = loop
         self.mod.OUTBOX_POLL = 0.2
-        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_BRIDGE_URL": f"http://127.0.0.1:{b.port}/v1"}):
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_BRIDGE_URL": f"http://127.0.0.1:{b.port}/v1",
+                                                   "HERMES_HOME": tempfile.mkdtemp(prefix="hermes-home-")}):
             self.deltas = [self.T, "hi"]
             agent = self.AIAgent(False)
             agent.session_id = "thread-out"
@@ -446,6 +447,102 @@ class PluginSegmentTests(unittest.TestCase):
         self.assertTrue(self.mod._deliver(msg))
         self.assertTrue(self.mod._deliver(msg), "already delivered: nothing is posted twice")
         self.assertEqual(ad.posts, [["done at last"]])
+
+    def _poller_env(self):
+        home = tempfile.mkdtemp(prefix="hermes-home-")
+        patcher = unittest.mock.patch.dict(os.environ, {"HERMES_HOME": home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return home
+
+    def _loop(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        return loop
+
+    def test_background_status_is_one_post_edited_and_frozen_when_text_lands_below(self):
+        self._poller_env()
+        ad = self.Adapter()
+        self.mod._targets["t"] = (ad, "chan", {"thread_id": "root"}, self._loop())
+        now = time.time()
+        for m in ({"id": 1, "kind": "status", "session_id": "t", "text": "⏳ 1m", "ts": now},
+                  {"id": 2, "kind": "status", "session_id": "t", "text": "⏳ 2m", "ts": now},
+                  {"id": 3, "kind": "text", "session_id": "t", "text": "halfway", "ts": now},
+                  {"id": 4, "kind": "status", "session_id": "t", "text": "⏳ 3m", "ts": now},
+                  {"id": 5, "kind": "status", "session_id": "t", "text": "✅ background work finished", "ts": now},
+                  {"id": 6, "kind": "status", "session_id": "t", "text": "⏳ 0m next job", "ts": now}):
+            self.assertTrue(self.mod._handle(m))
+        self.assertEqual(ad.posts, [["⏳ 1m", "⏳ 2m"], ["halfway"], ["⏳ 3m", "✅ background work finished"], ["⏳ 0m next job"]])
+
+    def _serve_outbox(self, items, epoch="e1"):
+        """A stand-in bridge outbox."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        box = {"items": items, "epoch": epoch}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                after = int(self.path.split("after=")[1]) if "after=" in self.path else 0
+                body = json.dumps({"messages": [m for m in box["items"] if m["id"] > after],
+                                   "last": max([m["id"] for m in box["items"]] or [0]), "epoch": box["epoch"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1], box
+
+    def _run_poller(self, port, secs=1.0):
+        self.mod.OUTBOX_POLL = 0.1
+        stop = threading.Event()
+        orig_sleep = self.mod.time.sleep
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_BRIDGE_URL": f"http://127.0.0.1:{port}/v1"}):
+            th = threading.Thread(target=self._poll_until, args=(stop,), daemon=True)
+            th.start()
+            orig_sleep(secs)
+            stop.set()
+            th.join(2)
+
+    def _poll_until(self, stop):
+        class Stop(Exception):
+            pass
+        real = self.mod.time.sleep
+
+        def sleep(x):
+            if stop.is_set():
+                raise Stop
+            real(x)
+        with unittest.mock.patch.object(self.mod.time, "sleep", sleep):
+            try:
+                self.mod._poll_outbox()
+            except Stop:
+                pass
+
+    def test_nothing_queued_before_the_poller_starts_is_lost_or_repeated_after_a_restart(self):
+        self._poller_env()
+        ad = self.Adapter()
+        now = time.time()
+        port, box = self._serve_outbox([{"id": 1, "kind": "text", "session_id": "t", "text": "early", "ts": now},
+                                        {"id": 2, "kind": "text", "session_id": "other", "text": "wait for me", "ts": now}])
+        self.mod._targets["t"] = (ad, "chan", {"thread_id": "root"}, self._loop())
+        self._run_poller(port)
+        self.assertEqual(ad.posts, [["early"]], "queued before the first poll, still delivered")
+        # gateway restart: a fresh poller reads the saved cursor -- no repeat; the waiting one is still pending
+        box["items"].append({"id": 3, "kind": "text", "session_id": "t", "text": "later", "ts": now})
+        self.mod._targets["other"] = (ad, "chan", {"thread_id": "root"}, self._loop())
+        self._run_poller(port)
+        self.assertEqual(ad.posts, [["early"], ["wait for me"], ["later"]])
+        # bridge restart: new epoch, ids start again at 1
+        box.update(epoch="e2", items=[{"id": 1, "kind": "text", "session_id": "t", "text": "new bridge", "ts": now}])
+        self._run_poller(port)
+        self.assertEqual(ad.posts[-1], ["new bridge"])
+        self.assertEqual(len(ad.posts), 4)
 
     def test_concurrent_turns_start_one_outbox_poller(self):
         self.mod.OUTBOX_POLL = 60
@@ -977,7 +1074,7 @@ class LiveSessionTests(unittest.TestCase):
                                                              {"role": "assistant", "content": "reply[new] one"}]),
                          "reply[new] two")
         self.assertEqual(len(set(self.pids(b))), 1, "the second message went to the same running claude")
-        self.assertEqual(b.get("/health")["live"], 1)
+        self.assertEqual((b.get("/health")["live"], b.get("/health")["busy"]), (1, 0))
 
     def test_background_work_outlives_the_reply_and_its_result_goes_to_the_outbox(self):
         b = self.bridge()
@@ -1044,6 +1141,7 @@ class LiveSessionTests(unittest.TestCase):
         b.chat("go BG:2.5", "thread-keep")
         time.sleep(1.5)
         self.assertEqual(b.get("/health")["live"], 1, "not closed while its background task runs")
+        self.assertEqual(b.get("/health")["busy"], 1)
         self.assertEqual([m["text"] for m in self.outbox(b)["messages"]], ["bg finished bgtask1"])
 
     def test_max_live_closes_the_longest_idle_process(self):
@@ -1090,6 +1188,44 @@ class LiveSessionTests(unittest.TestCase):
         got = self.outbox(b, want=1, wait=10)
         self.assertEqual([m["text"] for m in got["messages"]], ["bg finished bgtask1\n\nreply[new] are you there?"])
         self.assertEqual(len(set(self.pids(b))), 1, "nothing was interrupted or killed")
+
+    def test_background_work_gets_a_status_line_and_a_last_one_when_done(self):
+        b = self.bridge("--stats-interval", "1", "--bg-checkin", "0")
+        b.chat("go BG:7", "thread-status")
+        got = self.outbox(b, want=3, wait=15)
+        status = [m for m in got["messages"] if m["kind"] == "status"]
+        self.assertTrue(status and status[0]["text"].startswith("⏳ background, "), status)
+        self.assertIn("last 1s: cpu", status[0]["text"])
+        for _ in range(60):
+            got = b.get("/v1/claude_bridge/outbox?after=0")
+            if any(m["text"].startswith("✅") for m in got["messages"]):
+                break
+            time.sleep(0.25)
+        kinds = [(m["kind"], m["text"][:20]) for m in got["messages"]]
+        self.assertIn(("text", "bg finished bgtask1"), kinds)
+        self.assertEqual([m["text"] for m in got["messages"] if m["kind"] == "status"][-1], "✅ background work finished")
+        self.assertIn("epoch", got)
+
+    def test_the_bridge_asks_for_a_progress_update_while_background_work_runs(self):
+        b = self.bridge("--bg-checkin", "1.5", "--stats-interval", "0")
+        b.chat("go BG:30", "thread-checkin")
+        got = self.outbox(b, want=1, wait=20)
+        texts = [m["text"] for m in got["messages"] if m["kind"] == "text"]
+        self.assertTrue(texts and "[bridge] Background work in this chat has been running" in texts[0], texts)
+        self.assertEqual(len(set(self.pids(b))), 1)
+
+    def test_background_work_is_stopped_after_the_cap_with_no_message_despite_check_ins(self):
+        b = self.bridge("--timeout", "4", "--bg-checkin", "1", "--live-idle", "1", "--stats-interval", "0")
+        b.chat("go BG:60", "thread-runaway")
+        got = self.outbox(b, want=1, wait=20)
+        for _ in range(40):
+            got = b.get("/v1/claude_bridge/outbox?after=0")
+            if any("stopped 1 background task" in m["text"] for m in got["messages"]):
+                break
+            time.sleep(0.5)
+        self.assertTrue(any("stopped 1 background task(s): no message in this chat" in m["text"] for m in got["messages"]),
+                        [m["text"][:60] for m in got["messages"]])
+        self.assertEqual(b.get("/health")["live"], 0)
 
     def test_outbox_refuses_cross_origin_and_checks_the_token(self):
         b = self.bridge("--auth-token", "sekret")

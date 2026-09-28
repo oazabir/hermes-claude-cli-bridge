@@ -769,14 +769,19 @@ class _Outbox:
         self.mu = threading.Lock()
         self.items: list[dict] = []
         self.last = 0
+        self.epoch = uuid.uuid4().hex[:12]  # ids restart with the bridge: a client's cursor is only valid per epoch
 
-    def add(self, hsid, sid, text):
+    def add(self, hsid, sid, text, kind="text"):
+        """kind "text": something claude said (post it once); "status": the thread's background-work status line
+        (keep one post per thread and edit it)."""
         with self.mu:
             self.last += 1
-            self.items.append({"id": self.last, "session_id": hsid, "thread": sid, "text": text, "ts": int(time.time())})
+            self.items.append({"id": self.last, "kind": kind, "session_id": hsid, "thread": sid, "text": text,
+                               "ts": int(time.time())})
             del self.items[:-self.KEEP]
-        print(f"[bridge] outbox #{self.last}: {len(text)} chars from thread {sid[:8]} (claude spoke on its own)",
-              file=sys.stderr)
+        if kind == "text":
+            print(f"[bridge] outbox #{self.last}: {len(text)} chars from thread {sid[:8]} (claude spoke on its own)",
+                  file=sys.stderr)
 
     def since(self, after: int):
         with self.mu:
@@ -824,8 +829,15 @@ class LiveSession:
         self.turn: _Turn | None = None
         self.spont: list[str] = []  # main-thread text of a turn claude started by itself
         self.bg_tasks: set = set()
+        self.bg_info: dict = {}  # task id -> (description, type, first seen)
         self.stderr: list[str] = []
         self.last = time.monotonic()  # last activity: a turn, or anything claude printed
+        self.spoke = time.monotonic()  # the chat last heard from this thread: a turn ended, or claude spoke on its own
+        self.bg_status_due = 0.0  # next background status line (0: none shown yet)
+        self.bg_status_shown = False
+        self.bg_sample = None
+        self.checkin_at = 0.0  # when the bridge last asked claude for a progress update
+        self.user_at = time.monotonic()  # last message from a person (check-ins do not count)
         self.closing = False
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=lambda: self.stderr.append(self.proc.stderr.read() or ""), daemon=True).start()
@@ -845,7 +857,7 @@ class LiveSession:
         t = _Turn(on_text, on_reasoning, on_tool)
         with self.mu:
             self.turn = t
-            self.last = time.monotonic()
+            self.last = self.user_at = time.monotonic()
         try:
             self._write({"type": "user", "uuid": t.uid, "session_id": "", "parent_tool_use_id": None,
                          "message": {"role": "user", "content": prompt}})
@@ -902,7 +914,11 @@ class LiveSession:
     def _route(self, ev: dict) -> None:
         kind, parent = ev.get("type"), ev.get("parent_tool_use_id")
         if kind == "system" and ev.get("subtype") == "background_tasks_changed":
-            self.bg_tasks = {x.get("task_id") for x in ev.get("tasks") or [] if isinstance(x, dict)}
+            tasks = [x for x in ev.get("tasks") or [] if isinstance(x, dict)]
+            self.bg_tasks = {x.get("task_id") for x in tasks}
+            now = time.monotonic()
+            self.bg_info = {x.get("task_id"): (x.get("description") or x.get("task_type") or "task", x.get("task_type") or "",
+                                               self.bg_info.get(x.get("task_id"), (None, None, now))[2]) for x in tasks}
             return
         t = self.turn
         if kind == "user" and ev.get("isReplay"):
@@ -928,6 +944,7 @@ class LiveSession:
         text, self.spont = "".join(self.spont).strip(), []
         if text:
             OUTBOX.add(self.hsid, self.sid, text)
+            self.spoke = time.monotonic()
 
     def _to_turn(self, t: _Turn, ev: dict) -> None:
         kind, now = ev.get("type"), time.monotonic()
@@ -953,6 +970,7 @@ class LiveSession:
         elif kind == "result":
             t.result = ev
             self.turn = None
+            self.spoke = time.monotonic()
             t.done.set()
 
 
@@ -1103,6 +1121,91 @@ def run_live(sid, hsid, key, cmd, prompt, cwd, on_text, on_reasoning=None, on_to
         _slots.release()
 
 
+def _plain(desc: str, width: int = 60) -> str:
+    """A task description fit for the chat: no path-like words (the gateway would try to attach them)."""
+    words = [w for w in str(desc).replace("\n", " ").split() if "/" not in w and not w.startswith("#")]
+    text = " ".join(words) or "task"
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def bg_status_line(s: "LiveSession", now: float, u: dict | None, interval: float) -> str:
+    """'⏳ background, 48m: Wait for full suite… (Bash 48m), Review fix (Agent 12m) · last 1m: cpu 3.2s, read 1.1 MB'"""
+    tasks = sorted(s.bg_info.values(), key=lambda x: x[2])
+    head = f"⏳ background, {_dur(now - tasks[0][2])}: " if tasks else "⏳ background: "
+    shown = [f"{_plain(d, 50)} ({(t or 'task').replace('local_', '')} {_dur(now - t0)})" for d, t, t0 in tasks[:4]]
+    if len(tasks) > 4:
+        shown.append(f"+{len(tasks) - 4} more")
+    parts = [head + ", ".join(shown)]
+    if u is not None:
+        io = f", read {_size(u['read'])}, wrote {_size(u['written'])}" if u["io"] else ""
+        parts.append(f"last {_dur(interval).replace('m00s', 'm')}: cpu {u['cpu'] + u['claude_cpu']:.1f}s{io}")
+    return " · ".join(parts)
+
+
+CHECKIN_PROMPT = ("[bridge] Background work in this chat has been running for {mins} min with no update to the chat. "
+                  "Post a short progress update (one or two lines: what is running, how far along it is -- look at "
+                  "its output if useful), then end your turn. Do not start new work unless it is needed.")
+
+
+def _bg_tick(s: "LiveSession", now: float) -> None:
+    """Between turns, while claude has background work running: every --stats-interval, a status line for the
+    thread's one background-status post; every --bg-checkin with nothing said, ask claude for a progress update.
+    When the work is gone, a last status line says so."""
+    every = getattr(CFG, "stats_interval", 60) or 0
+    if s.turn is not None or s.proc.poll() is not None:
+        return
+    if not s.bg_tasks:
+        if s.bg_status_shown:
+            s.bg_status_shown, s.bg_status_due, s.bg_sample = False, 0.0, None
+            OUTBOX.add(s.hsid, s.sid, "✅ background work finished", kind="status")
+        return
+    if every:
+        if not s.bg_status_due:
+            s.bg_status_due, s.bg_sample = now + every, _safe_sample(s.proc.pid)
+        elif now >= s.bg_status_due:
+            cur = _safe_sample(s.proc.pid)
+            u = None
+            if cur is not None and s.bg_sample is not None:
+                try:
+                    u = tree_usage(s.bg_sample, cur, s.proc.pid)
+                except Exception:
+                    u = None
+            s.bg_sample, s.bg_status_due, s.bg_status_shown = cur, now + every, True
+            OUTBOX.add(s.hsid, s.sid, bg_status_line(s, now, u, every), kind="status")
+    checkin = getattr(CFG, "bg_checkin", 0) or 0
+    if checkin and not s.spont and now - max(s.spoke, s.checkin_at) >= checkin:
+        s.checkin_at = now
+        oldest = min((x[2] for x in s.bg_info.values()), default=now)
+        try:
+            s._write({"type": "user", "uuid": str(uuid.uuid4()), "session_id": "", "parent_tool_use_id": None,
+                      "message": {"role": "user", "content": CHECKIN_PROMPT.format(mins=int((now - oldest) // 60))}})
+            print(f"[bridge] asked thread {s.sid[:8]} for a progress update", file=sys.stderr)
+        except (OSError, ValueError):
+            pass
+
+
+def _safe_sample(pid):
+    try:
+        return sample_tree(pid)
+    except Exception:
+        return None
+
+
+def _bg_loop() -> None:
+    while True:
+        time.sleep(max(0.2, min(5.0, (getattr(CFG, "stats_interval", 60) or 60) / 2,
+                                (getattr(CFG, "bg_checkin", 900) or 900) / 2)))
+        now = time.monotonic()
+        with _live_mu:
+            sessions = list(_live.values())
+        for s in sessions:
+            try:
+                with s.mu:
+                    _bg_tick(s, now)
+            except Exception as e:  # never let a status line take the bridge down
+                print(f"[bridge] background status failed: {e!r}", file=sys.stderr)
+
+
 def _live_reaper() -> None:
     """Close live sessions nobody is using: idle past --live-idle with no background work, or with background
     work still running but no turn for --timeout (so a runaway job cannot live forever)."""
@@ -1117,13 +1220,13 @@ def _live_reaper() -> None:
                         doomed.append((_live.pop(sid), "exited"))
                     elif s.turn is None and not s.spont and not s.bg_tasks and idle_s and now - s.last >= idle_s:
                         doomed.append((_live.pop(sid), f"idle {now - s.last:.0f}s"))
-                    elif s.turn is None and s.bg_tasks and cap and now - s.last >= cap:
-                        doomed.append((_live.pop(sid), f"background work quiet for {now - s.last:.0f}s"))
+                    elif s.turn is None and s.bg_tasks and cap and now - s.user_at >= cap:
+                        doomed.append((_live.pop(sid), f"background work with no message for {now - s.user_at:.0f}s"))
             for s, why in doomed:
                 print(f"[bridge] closing live session {s.sid[:8]}: {why}", file=sys.stderr)
                 if s.bg_tasks:
-                    OUTBOX.add(s.hsid, s.sid, f"_(stopped {len(s.bg_tasks)} background task(s): no activity for "
-                                              f"{now - s.last:.0f}s, over the {cap:g}s limit)_")
+                    OUTBOX.add(s.hsid, s.sid, f"_(stopped {len(s.bg_tasks)} background task(s): no message in this "
+                                              f"chat for {_dur(now - s.user_at)}, over the {_dur(cap)} limit)_")
                 s.close()
         except Exception as e:  # never let housekeeping kill the server
             print(f"[bridge] live reaper failed: {e!r}", file=sys.stderr)
@@ -1332,7 +1435,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") in ("/health", "/healthz"):
-            return self._json(200, {"ok": True, "sessions": len(_load_state()), "live": len(_live),
+            with _live_mu:
+                busy = sum(1 for x in _live.values() if x.busy())
+            return self._json(200, {"ok": True, "sessions": len(_load_state()), "live": len(_live), "busy": busy,
                                     "session_ttl_days": getattr(CFG, "session_ttl_days", 0)})
         if self.path.split("?")[0].rstrip("/") == "/v1/claude_bridge/outbox":
             if self.headers.get("Origin"):
@@ -1342,7 +1447,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(401, {"error": {"message": "invalid or missing bearer token"}})
             m = re.search(r"[?&]after=(-?\d+)", self.path)
             items, last = OUTBOX.since(int(m.group(1)) if m else 0)
-            return self._json(200, {"messages": items, "last": last})
+            return self._json(200, {"messages": items, "last": last, "epoch": OUTBOX.epoch})
         if self.path.rstrip("/") == "/v1/models":
             return self._json(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "claude-code"} for m in MODELS]})
         if self.path.startswith("/v1/models/") and self.path.rsplit("/", 1)[1] in MODELS:
@@ -1559,6 +1664,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--live-idle", type=float, default=float(env("CLAUDE_BRIDGE_LIVE_IDLE", "900")),
                     help="with --live: close a thread's claude after this long with no turn and no background work "
                          "(default 900; the next message resumes the session)")
+    ap.add_argument("--bg-checkin", type=float, default=float(env("CLAUDE_BRIDGE_BG_CHECKIN", "900")),
+                    help="with --live: while background work runs and nothing has been said for this long, ask claude "
+                         "for a one-line progress update, posted to the thread (a short model turn; default 900; 0 = off)")
     ap.add_argument("--max-live", type=int, default=int(env("CLAUDE_BRIDGE_MAX_LIVE", "8")),
                     help="with --live: most claude processes kept at once; the longest-idle one is closed to make room "
                          "(default 8)")
@@ -1620,12 +1728,13 @@ def main(argv=None):
     threading.Thread(target=_housekeeping_loop, daemon=True).start()
     if CFG.live:
         threading.Thread(target=_live_reaper, daemon=True).start()
+        threading.Thread(target=_bg_loop, daemon=True).start()
     print(f"[bridge] listening on http://{CFG.host}:{CFG.port}/v1  (claude={CFG.claude_bin} add_dirs={CFG.add_dir} "
           f"effort={CFG.effort or 'default'} autocompact={CFG.autocompact or 'default'} "
           f"prompt_files={CFG.append_system_prompt_file or '-'} ttl_days={CFG.session_ttl_days or 'off'} "
           f"max_concurrency={CFG.max_concurrency} client_check={CFG.client_check_interval or 'off'}s "
           f"timeout={CFG.timeout or 'off'}s bg_wait={CFG.bg_wait or 0:g}s idle={CFG.idle_timeout or 'off'}s stats={CFG.stats_interval or 'off'}s "
-          f"live={'on idle=%gs max=%d' % (CFG.live_idle, CFG.max_live) if CFG.live else 'off'} "
+          f"live={'on idle=%gs max=%d checkin=%gs' % (CFG.live_idle, CFG.max_live, CFG.bg_checkin) if CFG.live else 'off'} "
           f"auth={'token' if CFG.auth_token else 'none'})", file=sys.stderr)
     def _term(*_):
         raise KeyboardInterrupt  # systemd stop: fall through to close the live sessions

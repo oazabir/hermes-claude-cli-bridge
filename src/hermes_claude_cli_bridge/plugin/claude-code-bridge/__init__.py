@@ -278,6 +278,9 @@ def _remember_target(agent) -> None:
     if not (sid and target[0] and target[1] and target[3] and callable(getattr(target[0], "send", None))):
         return
     _targets[sid] = target
+    bp = _bg_posts.get(sid)
+    if bp is not None:
+        bp.freeze()  # a turn starts: its own status post takes over; background status resumes in a new post below
     with _poller_lock:  # two turns at once must not start two pollers (every message would be posted twice)
         if OUTBOX_POLL > 0 and not _poller:
             th = threading.Thread(target=_poll_outbox, name="claude-bridge-outbox", daemon=True)
@@ -305,31 +308,129 @@ def _deliver(msg) -> bool:
     return True
 
 
+class _BgPost:
+    """A thread's background-work status: one post, edited in place each minute while the work runs. Frozen when
+    something lands below it (claude speaks, or a turn starts), so the next status line starts a new post."""
+
+    def __init__(self, sid):
+        self.sid, self.mid = sid, None
+
+    def show(self, text) -> bool:
+        import asyncio
+        target = _targets.get(self.sid)
+        if target is None:
+            return False
+        adapter, chat_id, meta, loop = target
+        try:
+            if self.mid is None:
+                res = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, text, metadata=meta), loop).result(timeout=30)
+                if getattr(res, "success", True) is False:
+                    return False
+                self.mid = getattr(res, "message_id", None)
+            else:
+                asyncio.run_coroutine_threadsafe(adapter.edit_message(chat_id, self.mid, text), loop).result(timeout=30)
+        except Exception:
+            return False
+        return True
+
+    def freeze(self):
+        self.mid = None
+
+
+_bg_posts: dict = {}  # Hermes session id -> _BgPost
+
+
+def _cursor_path() -> str:
+    home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.path.join(home, "claude-bridge", "outbox-cursor.json")
+
+
+def _load_cursor(path):
+    try:
+        with open(path) as f:
+            c = json.load(f)
+        return c.get("epoch"), int(c.get("after") or 0), set(c.get("done") or [])
+    except (OSError, ValueError, TypeError):
+        return None, 0, set()
+
+
+def _save_cursor(path, epoch, after, done) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"epoch": epoch, "after": after, "done": sorted(done)}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _handle(msg) -> bool:
+    """Deliver one outbox item. True when it needs no retry."""
+    sid = msg.get("session_id")
+    if msg.get("kind") == "status":
+        bp = _bg_posts.setdefault(sid, _BgPost(sid))
+        ok = bp.show(msg.get("text") or "")
+        if ok and (msg.get("text") or "").startswith("✅"):
+            bp.freeze()  # the work is over: the next background status starts afresh
+        return ok
+    if not _deliver(msg):
+        return False
+    bp = _bg_posts.get(sid)
+    if bp is not None:
+        bp.freeze()  # this text sits below the status post now
+    return True
+
+
 def _poll_outbox() -> None:
-    """Runs for the life of the gateway. Skips whatever was queued before it started (no thread to post it to
-    is known yet); stops for good on a bridge without an outbox (404)."""
+    """Runs for the life of the gateway. Nothing is skipped: a message waits (up to OUTBOX_KEEP) until its thread
+    is known -- the plugin learns a thread's chat from a turn in it -- and the position is kept on disk per bridge
+    epoch, so neither a gateway nor a bridge restart skips or repeats messages. Of a thread's status lines only
+    the newest matters. Stops for good on a bridge without an outbox (404)."""
     url = os.getenv("CLAUDE_CODE_BRIDGE_URL", "http://127.0.0.1:9181/v1").rstrip("/") + "/claude_bridge/outbox"
     token = os.getenv("CLAUDE_CODE_BRIDGE_TOKEN", "")
-    after, pending = None, []  # pending: fetched, not delivered yet (thread unknown so far, or the post failed)
+    path = _cursor_path()  # fixed for the poller's life
+    epoch, after, done = _load_cursor(path)
+    pending: list = []  # fetched, not delivered yet (thread unknown so far, or the post failed)
     while True:
         try:
-            req = urllib.request.Request(f"{url}?after={after or 0}",
+            req = urllib.request.Request(f"{url}?after={after}",
                                          headers={"Authorization": f"Bearer {token}"} if token else {})
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.load(r)
-            if after is None:
-                after = int(data.get("last") or 0)
-            else:
-                for msg in data.get("messages") or []:
+            if data.get("epoch") != epoch:  # a new bridge: its ids start again at 1
+                epoch, after, done, pending = data.get("epoch"), 0, set(), []
+                continue
+            for msg in data.get("messages") or []:
+                after = max(after, int(msg.get("id") or 0))
+                if int(msg.get("id") or 0) not in done:
                     pending.append(msg)
-                    after = max(after, int(msg.get("id") or 0))
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return
         except Exception:
             pass
         now = time.time()
-        pending = [m for m in pending if not _deliver(m) and now - (m.get("ts") or now) < OUTBOX_KEEP]
+        newest = {}  # per thread, only the latest status line is worth showing
+        for m in pending:
+            if m.get("kind") == "status":
+                newest[m.get("session_id")] = m.get("id")
+        keep = []
+        for m in pending:
+            if m.get("kind") == "status" and (newest.get(m.get("session_id")) != m.get("id") or now - (m.get("ts") or now) > 300):
+                done.add(int(m.get("id") or 0))
+                continue
+            if _handle(m):
+                done.add(int(m.get("id") or 0))
+            elif now - (m.get("ts") or now) < OUTBOX_KEEP:
+                keep.append(m)
+            else:
+                done.add(int(m.get("id") or 0))
+        pending = keep
+        floor = min([int(m.get("id") or 0) for m in pending] or [after + 1]) - 1  # re-fetch undelivered after a restart
+        done = {i for i in done if i > floor}
+        _save_cursor(path, epoch, floor, done)
+        after = max(after, floor)
         time.sleep(OUTBOX_POLL)
 
 
