@@ -113,7 +113,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_health_and_models(self):
         self.assertTrue(self.b.get("/health")["ok"])
-        self.assertEqual([m["id"] for m in self.b.get("/v1/models")["data"]], ["sonnet", "opus", "haiku"])
+        self.assertEqual([m["id"] for m in self.b.get("/v1/models")["data"]], ["sonnet", "opus", "haiku", "opusplan"])
 
     def test_first_turn_session_id_then_resume_with_only_new_message(self):
         first = self.b.chat("hello one", "thread-1")
@@ -1326,6 +1326,29 @@ class BundledPromptTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_image_parts_are_saved_and_referenced(self):
+        import base64
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.object(bridge, "IMAGE_DIR", bridge.Path(d)):
+            out = bridge._text([{"type": "text", "text": "look"},
+                                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + png}}])
+            self.assertIn("look", out)
+            self.assertIn("[Image attached: ", out)
+            self.assertEqual(len(list(bridge.Path(d).glob("*.png"))), 1)
+            self.assertIn("[Image could not be loaded]", bridge._text([{"type": "image_url", "image_url": {"url": "ftp://x"}}]))
+
+    def test_inline_images_only_when_enabled(self):
+        with tempfile.TemporaryDirectory() as d:
+            img = bridge.Path(d) / "a.png"
+            img.write_bytes(b"fake")
+            prompt = f"see [Image attached: {img} -- open it with the Read tool to see it] ok"
+            with unittest.mock.patch.dict(os.environ, {"CLAUDE_BRIDGE_INLINE_IMAGES": "0"}):
+                self.assertIsNone(bridge.inline_image_prompt(prompt))
+            with unittest.mock.patch.dict(os.environ, {"CLAUDE_BRIDGE_INLINE_IMAGES": "1"}):
+                blocks = json.loads(bridge.inline_image_prompt(prompt))["message"]["content"]
+            self.assertEqual([b["type"] for b in blocks], ["text", "image", "text"])
+            self.assertEqual(blocks[1]["source"]["media_type"], "image/png")
+
     def test_sample_tree_sees_this_process_and_its_children(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
         try:

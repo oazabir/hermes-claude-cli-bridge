@@ -41,7 +41,7 @@ from pathlib import Path
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 NAMESPACE = uuid.UUID("6f1d3a52-8c1e-4c5e-9a53-4d1f6f0c7b11")
-MODELS = ["sonnet", "opus", "haiku"]
+MODELS = ["sonnet", "opus", "haiku", "opusplan"]
 # Streamed as content of their own when the client asked for segments (the Hermes plugin does). TEXT_RUN and
 # TOOL_RUN open a run of Claude text or tool headlines; FLUSH_TICK says "post the progress so far" (sent every
 # --flush-interval seconds while the turn produces output). The plugin maps them onto Hermes' own new-message
@@ -181,14 +181,48 @@ def strip_memory_context(text: str) -> str:
     return _MEMORY_CTX.sub("\n\n", text).strip()
 
 
+IMAGE_DIR = Path(os.environ.get("CLAUDE_BRIDGE_IMAGE_DIR", "/tmp/claude-bridge-images"))
+_IMG_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+
+
+def _save_image(url: str) -> str:
+    """Write an image_url part (data: URI or http(s) URL) to a file Claude can Read; return the path ('' on failure)."""
+    import base64
+    import hashlib
+    import urllib.request
+    try:
+        if url.startswith("data:"):
+            head, _, b64 = url.partition(",")
+            mime, data = head[5:].split(";")[0], base64.b64decode(b64)
+        elif url.startswith(("http://", "https://")):
+            req = urllib.request.Request(url, headers={"User-Agent": "claude-bridge"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                mime, data = r.headers.get_content_type(), r.read(20 * 1024 * 1024)
+        else:
+            return ""
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        path = IMAGE_DIR / (hashlib.sha256(data).hexdigest()[:24] + _IMG_EXT.get(mime, ".jpg"))
+        path.write_bytes(data)
+        return str(path)
+    except Exception:
+        return ""
+
+
 def _text(content) -> str:
     if isinstance(content, str):
         return MARKERS.sub("", strip_memory_context(content))
     if isinstance(content, list):
-        return "\n".join(
-            MARKERS.sub("", strip_memory_context(p.get("text", "")))
-            for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text")
-        )
+        out = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") in ("text", "input_text"):
+                out.append(MARKERS.sub("", strip_memory_context(p.get("text", ""))))
+            elif p.get("type") in ("image_url", "input_image"):
+                u = p.get("image_url")
+                path = _save_image(u.get("url", "") if isinstance(u, dict) else (u or ""))
+                out.append(f"[Image attached: {path} -- open it with the Read tool to see it]" if path else "[Image could not be loaded]")
+        return "\n".join(out)
     return ""
 
 
@@ -532,8 +566,39 @@ def claude_env() -> dict:
 BG_GRACE = 5.0  # with --bg-wait 0: seconds claude gets after its answer to exit by itself before it is stopped
 
 
+_IMG_REF = re.compile(r"\[Image attached: (\S+) -- open it with the Read tool to see it\]")
+_MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def inline_image_prompt(prompt: str) -> str | None:
+    """CLAUDE_BRIDGE_INLINE_IMAGES=1: turn the '[Image attached: path ...]' lines into stream-json image blocks so
+    claude sees the picture in the first model call instead of spending a second one on the Read tool.
+    Returns the stdin payload, or None when the prompt has no readable image."""
+    import base64
+    if os.environ.get("CLAUDE_BRIDGE_INLINE_IMAGES") != "1" or not _IMG_REF.search(prompt):
+        return None
+    blocks, pos = [], 0
+    for m in _IMG_REF.finditer(prompt):
+        if prompt[pos:m.start()].strip():
+            blocks.append({"type": "text", "text": prompt[pos:m.start()].strip()})
+        try:
+            data = Path(m.group(1)).read_bytes()
+        except OSError:
+            return None
+        blocks.append({"type": "image", "source": {"type": "base64",
+                       "media_type": _MEDIA.get(Path(m.group(1)).suffix, "image/jpeg"),
+                       "data": base64.b64encode(data).decode()}})
+        pos = m.end()
+    if prompt[pos:].strip():
+        blocks.append({"type": "text", "text": prompt[pos:].strip()})
+    return json.dumps({"type": "user", "message": {"role": "user", "content": blocks}}) + "\n"
+
+
 def _run_claude(cmd: list[str], prompt: str, cwd: str, on_text, on_reasoning=None, on_tool=None, client_gone=None,
                 on_stats=None):
+    inline = inline_image_prompt(prompt)
+    if inline is not None:
+        cmd, prompt = cmd + ["--input-format", "stream-json"], inline
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True, env=claude_env(),
@@ -1288,6 +1353,8 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None,
     messages = body.get("messages") or []
     ext = body.get("claude_bridge") or {}
     model = body.get("model") or CFG.model
+    # cron runs take the first reply as the result and have no chat for later output: never live for them
+    live = getattr(CFG, "live", False) and not str(ext.get("session_id") or "").startswith("cron_")
     if model not in MODELS and not model.startswith("claude-"):
         model = CFG.model  # unknown hermes-side name -> bridge default
     opts = {
@@ -1298,7 +1365,7 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None,
                 *(_read_prompt_file(f) for f in CFG.append_system_prompt_file),
                 ext.get("append_system_prompt"),
                 hermes_system(messages) if CFG.forward_system else (session_context(messages) if CFG.session_context else ""),
-                LIVE_NOTE if getattr(CFG, "live", False) and ext.get("session_id") else "",
+                LIVE_NOTE if live and ext.get("session_id") else "",
             ) if p
         ),
         "autocompact": ext.get("autocompact") or CFG.autocompact,
@@ -1330,7 +1397,7 @@ def turn(body: dict, on_text, on_reasoning=None, on_tool=None, client_gone=None,
             streamed: list[str] = []
             run_cwd = state.get(sid, {}).get("cwd", cwd)
             cmd = build_cmd(model=model, session=sid, resume=resume, opts=opts, persist=True)
-            if getattr(CFG, "live", False):
+            if live:
                 res, err = run_live(sid, hsid, _live_key(model, opts, run_cwd), cmd + LIVE_FLAGS, prompt, run_cwd,
                                     lambda t: (streamed.append(t), on_text(t)), on_reasoning, on_tool, client_gone,
                                     on_stats)
